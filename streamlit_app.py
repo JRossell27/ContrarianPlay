@@ -5,6 +5,7 @@ from contrarian import (
     collect_market_moves,
     extract_state,
     fetch_injuries,
+    fetch_game_injuries,
     fetch_odds_page,
     iso_to_local_text,
     iter_events,
@@ -45,6 +46,11 @@ def cached_state():
 @st.cache_data(ttl=900)
 def cached_injuries(league: str):
     return fetch_injuries(league)
+
+
+@st.cache_data(ttl=600)
+def cached_game_injuries(game_id: str):
+    return fetch_game_injuries(game_id)
 
 
 def _normalize_team(name: str) -> str:
@@ -185,6 +191,7 @@ if fetch:
             if league not in leagues:
                 continue
             league_inj = cached_injuries(league)
+            game_inj = cached_game_injuries(line.get("id", ""))
             picks = collect_market_moves(
                 league,
                 line,
@@ -193,14 +200,14 @@ if fetch:
                 moneyline_threshold=moneyline_threshold,
             )
             if picks:
-                results.setdefault(league, []).append((line, picks, league_inj))
+                results.setdefault(league, []).append((line, picks, league_inj, game_inj))
 
     if not results:
         st.info("No contrarian candidates found with the current thresholds.")
     else:
         for league in sorted(results.keys()):
             st.header(league)
-            for line, picks, league_inj in results[league]:
+            for line, picks, league_inj, game_inj in results[league]:
                 competitors = line.get("competitors", [])
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -210,8 +217,10 @@ if fetch:
                 st.subheader(f"{away_team} @ {home_team}")
                 st.caption(start)
                 # Injury snippets
-                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
-                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+                home_inj = game_inj.get(_normalize_team(home_team), []) or league_inj.get(_normalize_team(home_team), [])
+                away_inj = game_inj.get(_normalize_team(away_team), []) or league_inj.get(_normalize_team(away_team), [])
+                home_inj = home_inj[:3]
+                away_inj = away_inj[:3]
                 if home_inj or away_inj:
                     txt = []
                     if away_inj:
@@ -261,6 +270,7 @@ if fetch and state:
         if league not in sport_total_thresholds:
             continue
         league_inj = cached_injuries(league)
+        game_inj = cached_game_injuries(line.get("id", ""))
         picks = collect_market_moves(
             league,
             line,
@@ -270,14 +280,14 @@ if fetch and state:
         )
         total_picks = [p for p in picks if p.startswith("FOLLOW: Over") or p.startswith("FOLLOW: Under")]
         if total_picks:
-            totals_results.setdefault(league, []).append((line, total_picks, league_inj))
+            totals_results.setdefault(league, []).append((line, total_picks, league_inj, game_inj))
 
     if not totals_results:
         st.info("No totals moves met the sport-specific thresholds.")
     else:
         for league in sorted(totals_results.keys()):
             st.subheader(league)
-            for line, picks, league_inj in totals_results[league]:
+            for line, picks, league_inj, game_inj in totals_results[league]:
                 competitors = line.get("competitors", [])
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -285,8 +295,10 @@ if fetch and state:
                 away_team = away.get("team", {}).get("displayName", "Away")
                 start = iso_to_local_text(line.get("date", ""))
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
-                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
-                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+                home_inj = game_inj.get(_normalize_team(home_team), []) or league_inj.get(_normalize_team(home_team), [])
+                away_inj = game_inj.get(_normalize_team(away_team), []) or league_inj.get(_normalize_team(away_team), [])
+                home_inj = home_inj[:3]
+                away_inj = away_inj[:3]
                 if home_inj or away_inj:
                     txt = []
                     if away_inj:

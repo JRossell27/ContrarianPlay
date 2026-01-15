@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
 
 ESPN_ODDS_URL = "https://www.espn.com/sports-betting/odds"
 LEAGUE_ALLOWLIST = {
@@ -248,6 +249,33 @@ def fetch_injuries(league: str) -> Dict[str, List[Dict[str, str]]]:
                 rows.append({"player": player, "pos": pos, "status": status, "injury": injury})
         if rows:
             result[_normalize_team(team_name)] = rows
+    return result
+
+
+def fetch_game_injuries(game_id: str) -> Dict[str, List[Dict[str, str]]]:
+    """Scrape injury tables from a specific game page. Best effort."""
+    if not game_id:
+        return {}
+    url = f"https://www.espn.com/nba/game/_/gameId/{game_id}"
+    try:
+        tables = pd.read_html(url)
+    except Exception:
+        return {}
+    result: Dict[str, List[Dict[str, str]]] = {}
+    for df in tables:
+        cols = [str(c).lower() for c in df.columns]
+        if not any("inj" in c for c in cols):
+            continue
+        # Expect columns like ['Player', 'Pos', 'Status', 'Injury']
+        for _, row in df.iterrows():
+            player = str(row.get(df.columns[0], "")).strip()
+            status = str(row.get("Status", row.get(df.columns[2], ""))).strip()
+            injury = str(row.get("Injury", row.get(df.columns[-1], ""))).strip()
+            team = str(row.get("Team", row.get(df.columns[-2], ""))).strip()
+            if not team:
+                continue
+            entry = {"player": player, "status": status, "injury": injury}
+            result.setdefault(_normalize_team(team), []).append(entry)
     return result
 
 
