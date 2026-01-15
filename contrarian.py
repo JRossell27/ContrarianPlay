@@ -83,7 +83,8 @@ def iter_events(state: Dict) -> Iterable[Tuple[str, Dict]]:
             yield league, line
 
 
-def collect_contrarian_picks(
+def collect_market_moves(
+    league: str,
     line: Dict,
     spread_threshold: float,
     total_threshold: float,
@@ -115,7 +116,7 @@ def collect_contrarian_picks(
         if None not in (home_open, home_cur, away_open, away_cur):
             home_ml_delta = home_cur - home_open
 
-    # Spreads (follow the move unless puck/run-line flip noise)
+    # Spreads (follow the move; price-only for NHL/MLB run/puck lines)
     spread = odds.get("pointSpread")
     if spread:
         home_open = parse_point(spread.get("home", {}).get("open", {}).get("line"))
@@ -125,57 +126,49 @@ def collect_contrarian_picks(
         home_open_price = american_to_prob(spread.get("home", {}).get("open", {}).get("odds"))
         home_cur_price = american_to_prob(spread.get("home", {}).get("close", {}).get("odds"))
         if None not in (home_open, home_cur, away_open, away_cur):
-            # Puck/run line guard: if both sides are +/-1.5 and simply flipped, treat as noise.
-            symmetrical_flip = (
-                abs(home_open) == abs(home_cur) == abs(away_open) == abs(away_cur) == 1.5
-                and home_open == -away_open
-                and home_cur == -away_cur
-                and home_open == -home_cur
-            )
-            if symmetrical_flip:
-                delta_points = home_cur - home_open
-                prob_shift = None
-                if None not in (home_open_price, home_cur_price):
-                    prob_shift = home_cur_price - home_open_price
-                # Only accept the flip if there is a real price move AND ML moves the same way.
-                if (
-                    prob_shift is not None
-                    and home_ml_delta is not None
-                    and abs(prob_shift) >= moneyline_threshold
-                    and prob_shift * home_ml_delta > 0
-                ):
-                    delta = delta_points
-                else:
-                    delta = 0.0
+            # NHL/MLB: spreads rarely move off ±1.5; use price shift primarily.
+            if league in {"NHL", "MLB"} and abs(home_open) == 1.5 and abs(home_cur) == 1.5:
+                if home_open_price is not None and home_cur_price is not None:
+                    price_delta = home_cur_price - home_open_price
+                    if abs(price_delta) >= moneyline_threshold:
+                        if price_delta > 0:
+                            picks.append(
+                                f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line"
+                            )
+                        else:
+                            picks.append(
+                                f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line"
+                            )
+                # skip point-based logic for puck/run lines
             else:
-                # Use distance to 0 to see which side the market favors.
-                delta_mag = abs(home_cur) - abs(home_open)
+                delta_line = home_cur - home_open
+                delta_mag = abs(home_cur) - abs(home_open)  # toward/away from 0
                 delta = delta_mag
-            # If the line itself didn't move meaningfully, fall back to price shift.
-            price_delta = None
-            if home_open_price is not None and home_cur_price is not None:
-                price_delta = home_cur_price - home_open_price
-            if delta <= -spread_threshold:
-                picks.append(
-                    f"FOLLOW: {home_team} {home_cur:+} — spread moved {delta:+.1f} from {home_open:+}"
-                )
-            elif delta >= spread_threshold:
-                picks.append(
-                    f"FOLLOW: {away_team} {away_cur:+} — spread moved {delta:+.1f} from {home_open:+}"
-                )
-            elif (
-                price_delta is not None
-                and abs(price_delta) >= moneyline_threshold
-                and abs(home_cur) == abs(home_open)
-            ):
-                if price_delta > 0:
+                # If the line itself didn't move meaningfully, fall back to price shift.
+                price_delta = None
+                if home_open_price is not None and home_cur_price is not None:
+                    price_delta = home_cur_price - home_open_price
+                if delta <= -spread_threshold:
                     picks.append(
-                        f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line"
+                        f"FOLLOW: {home_team} {home_cur:+} (was {home_open:+}) — line shift {delta_line:+.1f}"
                     )
-                else:
+                elif delta >= spread_threshold:
                     picks.append(
-                        f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line"
+                        f"FOLLOW: {away_team} {away_cur:+} (was {away_open:+}) — line shift {delta_line:+.1f}"
                     )
+                elif (
+                    price_delta is not None
+                    and abs(price_delta) >= moneyline_threshold
+                    and home_cur == home_open
+                ):
+                    if price_delta > 0:
+                        picks.append(
+                            f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line"
+                        )
+                    else:
+                        picks.append(
+                            f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line"
+                        )
 
     # Totals (follow-the-move)
     total = odds.get("total")
@@ -242,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_contrarian_picks(
+def get_market_moves(
     leagues: Optional[List[str]] = None,
     spread_threshold: Optional[float] = None,
     total_threshold: Optional[float] = None,
@@ -260,7 +253,7 @@ def get_contrarian_picks(
         s_thr = spread_threshold if spread_threshold is not None else defaults["spread"]
         t_thr = total_threshold if total_threshold is not None else defaults["total"]
         ml_thr = moneyline_threshold if moneyline_threshold is not None else defaults["ml_prob"]
-        picks = collect_contrarian_picks(line, s_thr, t_thr, ml_thr)
+        picks = collect_market_moves(league, line, s_thr, t_thr, ml_thr)
         if not picks:
             continue
         league_to_events.setdefault(league, []).append((line, picks))
@@ -269,7 +262,7 @@ def get_contrarian_picks(
 
 def main() -> None:
     args = parse_args()
-    league_to_events = get_contrarian_picks(
+    league_to_events = get_market_moves(
         leagues=list(LEAGUE_ALLOWLIST),
         spread_threshold=args.spread_threshold,
         total_threshold=args.total_threshold,
@@ -277,7 +270,7 @@ def main() -> None:
     )
 
     if not league_to_events:
-        print("No contrarian candidates found.")
+        print("No market-move candidates found.")
         return
 
     for league, events in league_to_events.items():

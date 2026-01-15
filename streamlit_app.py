@@ -2,7 +2,7 @@ import streamlit as st
 
 from contrarian import (
     LEAGUE_ALLOWLIST,
-    collect_contrarian_picks,
+    collect_market_moves,
     extract_state,
     fetch_odds_page,
     iso_to_local_text,
@@ -177,7 +177,8 @@ if fetch:
         for league, line in iter_events(state):
             if league not in leagues:
                 continue
-            picks = collect_contrarian_picks(
+            picks = collect_market_moves(
+                league,
                 line,
                 spread_threshold=spread_threshold,
                 total_threshold=total_threshold,
@@ -235,7 +236,8 @@ if fetch and state:
     for league, line in iter_events(state):
         if league not in sport_total_thresholds:
             continue
-        picks = collect_contrarian_picks(
+        picks = collect_market_moves(
+            league,
             line,
             spread_threshold=1e6,  # disable spread
             total_threshold=sport_total_thresholds[league],
