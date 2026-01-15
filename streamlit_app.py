@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from functools import lru_cache
+from typing import Optional, Dict, List
 
 
 st.set_page_config(page_title="Contrarian Plays", page_icon="📉", layout="wide")
