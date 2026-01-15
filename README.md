@@ -36,6 +36,13 @@ streamlit run streamlit_app.py
 Use the controls to pick leagues and adjust thresholds; click “Find contrarian plays” to refresh.
 There’s also a “Totals-only strategy” section with per-sport O/U move filters (e.g., NBA/NCAAM 1.5, NHL 0.5, NFL/NCAAF 2 by default).
 
+### Quick contrarian rules baked into the app
+- Only care about real moves: spreads ≥1.0 pt, totals ≥1.5 pts (NHL totals ≥0.5), ML ≳4% implied shift.
+- Follow the move unless news explains it (Total ↓ → Under; favorite cheaper → dog; ML favorite cheaper → dog).
+- If obvious injury/goalie/pitcher news explains the move, pass.
+- Freezes/reversals late can flip the lean; otherwise ride the direction.
+- If you can’t say in one sentence why the book is protecting that side, don’t bet it.
+
 ## How contrarian picks are chosen
 - **Spreads:** If the favorite is steamed (line gets more negative) by the threshold, back the dog with the extra points; if the dog is steamed, back the favorite at the better number.
 - **Totals:** If the total rises enough, lean under; if it falls enough, lean over.

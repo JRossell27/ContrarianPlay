@@ -22,6 +22,17 @@ st.caption(
     "Scrapes ESPN odds (open vs current) and highlights contrarian angles on spreads, totals, and moneylines."
 )
 
+with st.expander("How to read the signals (quick rules)"):
+    st.markdown(
+        """
+- ✅ Only care about real moves: spreads ≥1.0pt, totals ≥1.5pts (NHL totals ≥0.5 goals), ML shifts ≳4% implied.
+- ✅ Follow the move unless news explains it: Total ↓ → Under; favorite cheaper → underdog; ML favorite cheaper → look at dog.
+- ⚠️ Contrarian requires no obvious news: if injury/goalie/pitcher explains the move, pass.
+- ⚠️ Freezes/reversals matter: popular side not moving or a snap-back late can flip the lean.
+- ❌ If you can’t explain the bet in one sentence (“Line moved ___ with no news, book protecting ___”), pass.
+        """
+    )
+
 
 @st.cache_data(ttl=300)
 def cached_state():
