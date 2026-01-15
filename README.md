@@ -38,7 +38,7 @@ There’s also a “Totals-only strategy” section with per-sport O/U move filt
 
 ### Quick contrarian rules baked into the app
 - Only care about real moves: spreads ≥1.0 pt, totals ≥1.5 pts (NHL totals ≥0.5), ML ≳4% implied shift.
-- Follow the move unless news explains it (Total ↓ → Under; favorite cheaper → dog; ML favorite cheaper → dog).
+- Follow the move unless news explains it (Total ↓ → Under; favorite cheaper → dog; ML favorite cheaper → dog). In this build the scanner labels moves as FOLLOW (market-confirmed).
 - If obvious injury/goalie/pitcher news explains the move, pass.
 - Freezes/reversals late can flip the lean; otherwise ride the direction.
 - If you can’t say in one sentence why the book is protecting that side, don’t bet it.
