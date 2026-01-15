@@ -217,12 +217,12 @@ if fetch:
                     if away_inj:
                         txt.append(
                             f"{away_team} injuries: "
-                            + "; ".join(f\"{r['player']} ({r['status']})\" for r in away_inj)
+                            + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
                         )
                     if home_inj:
                         txt.append(
                             f"{home_team} injuries: "
-                            + "; ".join(f\"{r['player']} ({r['status']})\" for r in home_inj)
+                            + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
                         )
                     st.caption(" | ".join(txt))
                 for pick in picks:
