@@ -4,9 +4,11 @@ from contrarian import (
     LEAGUE_ALLOWLIST,
     collect_market_moves,
     extract_state,
+    fetch_injuries,
     fetch_odds_page,
     iso_to_local_text,
     iter_events,
+    _normalize_team,
 )
 
 import pandas as pd
@@ -38,6 +40,11 @@ with st.expander("How to read the signals (quick rules)"):
 def cached_state():
     html = fetch_odds_page()
     return extract_state(html)
+
+
+@st.cache_data(ttl=900)
+def cached_injuries(league: str):
+    return fetch_injuries(league)
 
 
 def _normalize_team(name: str) -> str:
@@ -177,6 +184,7 @@ if fetch:
         for league, line in iter_events(state):
             if league not in leagues:
                 continue
+            league_inj = cached_injuries(league)
             picks = collect_market_moves(
                 league,
                 line,
@@ -185,14 +193,14 @@ if fetch:
                 moneyline_threshold=moneyline_threshold,
             )
             if picks:
-                results.setdefault(league, []).append((line, picks))
+                results.setdefault(league, []).append((line, picks, league_inj))
 
     if not results:
         st.info("No contrarian candidates found with the current thresholds.")
     else:
         for league in sorted(results.keys()):
             st.header(league)
-            for line, picks in results[league]:
+            for line, picks, league_inj in results[league]:
                 competitors = line.get("competitors", [])
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -201,6 +209,22 @@ if fetch:
                 start = iso_to_local_text(line.get("date", ""))
                 st.subheader(f"{away_team} @ {home_team}")
                 st.caption(start)
+                # Injury snippets
+                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
+                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+                if home_inj or away_inj:
+                    txt = []
+                    if away_inj:
+                        txt.append(
+                            f"{away_team} injuries: "
+                            + "; ".join(f\"{r['player']} ({r['status']})\" for r in away_inj)
+                        )
+                    if home_inj:
+                        txt.append(
+                            f"{home_team} injuries: "
+                            + "; ".join(f\"{r['player']} ({r['status']})\" for r in home_inj)
+                        )
+                    st.caption(" | ".join(txt))
                 for pick in picks:
                     st.markdown(f"- {pick}")
                 st.divider()
@@ -236,6 +260,7 @@ if fetch and state:
     for league, line in iter_events(state):
         if league not in sport_total_thresholds:
             continue
+        league_inj = cached_injuries(league)
         picks = collect_market_moves(
             league,
             line,
@@ -243,16 +268,16 @@ if fetch and state:
             total_threshold=sport_total_thresholds[league],
             moneyline_threshold=1.0,  # disable ML
         )
-        total_picks = [p for p in picks if p.startswith("Bet: Over") or p.startswith("Bet: Under")]
+        total_picks = [p for p in picks if p.startswith("FOLLOW: Over") or p.startswith("FOLLOW: Under")]
         if total_picks:
-            totals_results.setdefault(league, []).append((line, total_picks))
+            totals_results.setdefault(league, []).append((line, total_picks, league_inj))
 
     if not totals_results:
         st.info("No totals moves met the sport-specific thresholds.")
     else:
         for league in sorted(totals_results.keys()):
             st.subheader(league)
-            for line, picks in totals_results[league]:
+            for line, picks, league_inj in totals_results[league]:
                 competitors = line.get("competitors", [])
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -260,6 +285,21 @@ if fetch and state:
                 away_team = away.get("team", {}).get("displayName", "Away")
                 start = iso_to_local_text(line.get("date", ""))
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
+                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
+                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+                if home_inj or away_inj:
+                    txt = []
+                    if away_inj:
+                        txt.append(
+                            f"{away_team} injuries: "
+                            + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
+                        )
+                    if home_inj:
+                        txt.append(
+                            f"{home_team} injuries: "
+                            + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
+                        )
+                    st.caption(" | ".join(txt))
                 for pick in picks:
                     st.markdown(f"- {pick}")
                 st.divider()
