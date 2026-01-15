@@ -252,11 +252,22 @@ def fetch_injuries(league: str) -> Dict[str, List[Dict[str, str]]]:
     return result
 
 
-def fetch_game_injuries(game_id: str) -> Dict[str, List[Dict[str, str]]]:
-    """Scrape injury tables from a specific game page. Best effort."""
+def fetch_game_injuries(league: str, game_id: str) -> Dict[str, List[Dict[str, str]]]:
+    """Scrape injury tables from a specific game page. Best effort per league."""
     if not game_id:
         return {}
-    url = f"https://www.espn.com/nba/game/_/gameId/{game_id}"
+    league_paths = {
+        "NBA": "nba",
+        "NCAAM": "mens-college-basketball",
+        "NFL": "nfl",
+        "NCAAF": "college-football",
+        "NHL": "nhl",
+        "MLB": "mlb",
+    }
+    path = league_paths.get(league)
+    if not path:
+        return {}
+    url = f"https://www.espn.com/{path}/game/_/gameId/{game_id}"
     try:
         tables = pd.read_html(url)
     except Exception:
@@ -272,6 +283,8 @@ def fetch_game_injuries(game_id: str) -> Dict[str, List[Dict[str, str]]]:
             status = str(row.get("Status", row.get(df.columns[2], ""))).strip()
             injury = str(row.get("Injury", row.get(df.columns[-1], ""))).strip()
             team = str(row.get("Team", row.get(df.columns[-2], ""))).strip()
+            if not team and len(df.columns) >= 5:
+                team = str(row.get(df.columns[-2], "")).strip()
             if not team:
                 continue
             entry = {"player": player, "status": status, "injury": injury}
@@ -356,8 +369,15 @@ def main() -> None:
             print(f"- {away_team} @ {home_team} — {start}")
             # Injury snippets (top 3 per team)
             league_inj = injuries_by_league.get(league, {})
-            home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
-            away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+            game_inj = fetch_game_injuries(league, line.get("id", ""))
+            home_inj = game_inj.get(_normalize_team(home_team), []) or league_inj.get(
+                _normalize_team(home_team), []
+            )
+            away_inj = game_inj.get(_normalize_team(away_team), []) or league_inj.get(
+                _normalize_team(away_team), []
+            )
+            home_inj = home_inj[:3]
+            away_inj = away_inj[:3]
             if home_inj or away_inj:
                 parts = []
                 if away_inj:

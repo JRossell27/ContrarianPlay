@@ -49,8 +49,8 @@ def cached_injuries(league: str):
 
 
 @st.cache_data(ttl=600)
-def cached_game_injuries(game_id: str):
-    return fetch_game_injuries(game_id)
+def cached_game_injuries(league: str, game_id: str):
+    return fetch_game_injuries(league, game_id)
 
 
 def _normalize_team(name: str) -> str:
@@ -366,15 +366,18 @@ if st.button("Find totals with context"):
     for league, line in iter_events(state):
         if league not in sport_total_thresholds:
             continue
-        picks = collect_contrarian_picks(
+        league_inj = inj_cache.get(league, {})
+        game_inj = cached_game_injuries(league, line.get("id", ""))
+        picks = collect_market_moves(
+            league,
             line,
             spread_threshold=1e6,  # disable spread
             total_threshold=sport_total_thresholds[league],
             moneyline_threshold=1.0,  # disable ML
         )
-        total_picks = [p for p in picks if p.startswith("Bet: Over") or p.startswith("Bet: Under")]
+        total_picks = [p for p in picks if p.startswith("FOLLOW: Over") or p.startswith("FOLLOW: Under")]
         if total_picks:
-            totals_results.setdefault(league, []).append((line, total_picks))
+            totals_results.setdefault(league, []).append((line, total_picks, league_inj, game_inj))
 
     if not totals_results:
         st.info("No totals moves met the sport-specific thresholds.")
@@ -410,9 +413,11 @@ if st.button("Find totals with context"):
                 if stat_line:
                     st.caption(" • ".join(stat_line))
 
-                # Injuries snippet
-                home_inj = injuries.get(_normalize_team(home_team), [])[:3]
-                away_inj = injuries.get(_normalize_team(away_team), [])[:3]
+                # Injuries snippet (game-level first, fallback to league-level)
+                home_inj = game_inj.get(_normalize_team(home_team), []) or injuries.get(_normalize_team(home_team), [])
+                away_inj = game_inj.get(_normalize_team(away_team), []) or injuries.get(_normalize_team(away_team), [])
+                home_inj = home_inj[:3]
+                away_inj = away_inj[:3]
                 if home_inj or away_inj:
                     txt = []
                     if home_inj:
@@ -426,6 +431,6 @@ if st.button("Find totals with context"):
                     st.caption(" | ".join(txt))
 
                 # Simple recommendation tag
-                rec = "Lean Over" if any(p.startswith("Bet: Over") for p in picks) else "Lean Under"
+                rec = "Lean Over" if any(p.startswith("FOLLOW: Over") for p in picks) else "Lean Under"
                 st.badge(rec)
                 st.divider()
