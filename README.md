@@ -34,6 +34,7 @@ Run a simple web UI locally:
 streamlit run streamlit_app.py
 ```
 Use the controls to pick leagues and adjust thresholds; click “Find contrarian plays” to refresh.
+There’s also a “Totals-only strategy” section with per-sport O/U move filters (e.g., NBA/NCAAM 1.5, NHL 0.5, NFL/NCAAF 2 by default).
 
 ## How contrarian picks are chosen
 - **Spreads:** If the favorite is steamed (line gets more negative) by the threshold, back the dog with the extra points; if the dog is steamed, back the favorite at the better number.
