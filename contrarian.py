@@ -142,12 +142,12 @@ def collect_contrarian_picks(
             if delta <= -spread_threshold:
                 # Steam toward home favorite; grab away with extra points.
                 picks.append(
-                    f"{away_team} {away_cur:+} (spread moved {delta:.1f} from {home_open:+} on {home_team})"
+                    f"Bet: {away_team} {away_cur:+} — spread moved {delta:+.1f} from {home_open:+} on {home_team}"
                 )
             elif delta >= spread_threshold:
                 # Steam toward away; grab home with better number.
                 picks.append(
-                    f"{home_team} {home_cur:+} (spread moved +{delta:.1f} from {home_open:+} vs {away_team})"
+                    f"Bet: {home_team} {home_cur:+} — spread moved {delta:+.1f} from {home_open:+} vs {away_team}"
                 )
 
     # Totals
@@ -158,9 +158,13 @@ def collect_contrarian_picks(
         if None not in (open_point, cur_point):
             delta = cur_point - open_point
             if delta >= total_threshold:
-                picks.append(f"Under {cur_point:.1f} (total up {delta:.1f} from {open_point:.1f})")
+                picks.append(
+                    f"Bet: Under {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}"
+                )
             elif delta <= -total_threshold:
-                picks.append(f"Over {cur_point:.1f} (total down {delta:.1f} from {open_point:.1f})")
+                picks.append(
+                    f"Bet: Over {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}"
+                )
 
     # Moneylines
     if moneyline:
@@ -173,14 +177,14 @@ def collect_contrarian_picks(
             if delta >= moneyline_threshold:
                 swing = delta * 100
                 picks.append(
-                    f"{away_team} ML {moneyline.get('away', {}).get('close', {}).get('odds')} "
-                    f"(fade steam on {home_team}, +{swing:.1f}pp)"
+                    f"Bet: {away_team} ML {moneyline.get('away', {}).get('close', {}).get('odds')} "
+                    f"— fade steam on {home_team} ({swing:+.1f}pp)"
                 )
             elif delta <= -moneyline_threshold:
                 swing = -delta * 100
                 picks.append(
-                    f"{home_team} ML {moneyline.get('home', {}).get('close', {}).get('odds')} "
-                    f"(fade steam on {away_team}, +{swing:.1f}pp)"
+                    f"Bet: {home_team} ML {moneyline.get('home', {}).get('close', {}).get('odds')} "
+                    f"— fade steam on {away_team} ({swing:+.1f}pp)"
                 )
 
     return picks
