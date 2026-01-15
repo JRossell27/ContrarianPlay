@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
+from bs4 import BeautifulSoup
 
 ESPN_ODDS_URL = "https://www.espn.com/sports-betting/odds"
 LEAGUE_ALLOWLIST = {
@@ -71,6 +72,10 @@ def iso_to_local_text(iso_str: str) -> str:
         return dt.strftime("%Y-%m-%d %I:%M %p UTC")
     except Exception:
         return iso_str
+
+
+def _normalize_team(name: str) -> str:
+    return name.lower().replace(".", "").replace("'", "").strip()
 
 
 def iter_events(state: Dict) -> Iterable[Tuple[str, Dict]]:
@@ -210,6 +215,42 @@ def collect_market_moves(
     return picks
 
 
+def fetch_injuries(league: str) -> Dict[str, List[Dict[str, str]]]:
+    urls = {
+        "NBA": "https://www.espn.com/nba/injuries",
+        "NFL": "https://www.espn.com/nfl/injuries",
+        "NHL": "https://www.espn.com/nhl/injuries",
+        "MLB": "https://www.espn.com/mlb/injuries",
+        "NCAAF": "https://www.espn.com/college-football/injuries",
+        "NCAAM": "https://www.espn.com/mens-college-basketball/injuries",
+    }
+    url = urls.get(league)
+    if not url:
+        return {}
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception:
+        return {}
+    soup = BeautifulSoup(resp.text, "html.parser")
+    result: Dict[str, List[Dict[str, str]]] = {}
+    for section in soup.find_all("section"):
+        header = section.find("h2")
+        table = section.find("table")
+        if not header or not table:
+            continue
+        team_name = header.get_text(strip=True)
+        rows: List[Dict[str, str]] = []
+        for tr in table.find_all("tr")[1:]:
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) >= 5:
+                player, pos, date, injury, status = tds[:5]
+                rows.append({"player": player, "pos": pos, "status": status, "injury": injury})
+        if rows:
+            result[_normalize_team(team_name)] = rows
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Market movement scanner from ESPN odds page (open vs current)."
@@ -273,6 +314,8 @@ def main() -> None:
         print("No market-move candidates found.")
         return
 
+    injuries_by_league = {lg: fetch_injuries(lg) for lg in league_to_events.keys()}
+
     for league, events in league_to_events.items():
         print(f"\n=== {league} ===")
         for line, picks in events:
@@ -283,6 +326,23 @@ def main() -> None:
             away_team = away.get("team", {}).get("displayName", "Away")
             start = iso_to_local_text(line.get("date", ""))
             print(f"- {away_team} @ {home_team} — {start}")
+            # Injury snippets (top 3 per team)
+            league_inj = injuries_by_league.get(league, {})
+            home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
+            away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
+            if home_inj or away_inj:
+                parts = []
+                if away_inj:
+                    parts.append(
+                        f"{away_team} injuries: "
+                        + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
+                    )
+                if home_inj:
+                    parts.append(
+                        f"{home_team} injuries: "
+                        + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
+                    )
+                print(f"    Injuries: {' | '.join(parts)}")
             for pick in picks:
                 print(f"    • {pick}")
 
