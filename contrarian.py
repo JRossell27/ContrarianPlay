@@ -79,6 +79,22 @@ def _normalize_team(name: str) -> str:
     return name.lower().replace(".", "").replace("'", "").strip()
 
 
+def _score(delta: float, threshold: float) -> float:
+    """Normalize move magnitude to [0.0, 1.0]. A move of 2× threshold scores 1.0."""
+    return min(abs(delta) / (2.0 * threshold), 1.0)
+
+
+def confidence_label(score: float) -> str:
+    """Human-readable confidence tier for a pick score."""
+    if score >= 0.75:
+        return "LOCK"
+    if score >= 0.50:
+        return "STRONG"
+    if score >= 0.25:
+        return "LEAN"
+    return "WATCH"
+
+
 def iter_events(state: Dict) -> Iterable[Tuple[str, Dict]]:
     odds_block = state.get("page", {}).get("content", {}).get("odds", {})
     for league_block in odds_block.get("odds", []):
@@ -95,8 +111,16 @@ def collect_market_moves(
     spread_threshold: float,
     total_threshold: float,
     moneyline_threshold: float,
-) -> List[str]:
-    picks: List[str] = []
+) -> List[Tuple[str, float]]:
+    """Return list of (pick_text, confidence_score) tuples.
+
+    Confidence score is [0.0, 1.0]:
+      - Base: normalized magnitude of line move (move of 2× threshold → 1.0).
+      - Convergence bonus (+0.25): spread and ML both moved toward the same team.
+      - Vig confirmation bonus (+0.15): spread line moved AND juice tightened in
+        the same direction, indicating sharp money rather than a stale adjustment.
+    """
+    picks: List[Tuple[str, float]] = []
 
     competitors = line.get("competitors", [])
     home = next((c for c in competitors if c.get("homeAway") == "home"), None)
@@ -111,18 +135,18 @@ def collect_market_moves(
         return picks
     odds = odds_list[0]
 
-    # Moneyline first to reuse probability delta as confirmation signal.
+    # ── Moneyline: compute delta first so spread section can use it for convergence.
     moneyline = odds.get("moneyline")
     home_ml_delta: Optional[float] = None
     if moneyline:
-        home_open = american_to_prob(moneyline.get("home", {}).get("open", {}).get("odds"))
-        home_cur = american_to_prob(moneyline.get("home", {}).get("close", {}).get("odds"))
-        away_open = american_to_prob(moneyline.get("away", {}).get("open", {}).get("odds"))
-        away_cur = american_to_prob(moneyline.get("away", {}).get("close", {}).get("odds"))
-        if None not in (home_open, home_cur, away_open, away_cur):
-            home_ml_delta = home_cur - home_open
+        home_ml_open = american_to_prob(moneyline.get("home", {}).get("open", {}).get("odds"))
+        home_ml_cur = american_to_prob(moneyline.get("home", {}).get("close", {}).get("odds"))
+        away_ml_open = american_to_prob(moneyline.get("away", {}).get("open", {}).get("odds"))
+        away_ml_cur = american_to_prob(moneyline.get("away", {}).get("close", {}).get("odds"))
+        if None not in (home_ml_open, home_ml_cur, away_ml_open, away_ml_cur):
+            home_ml_delta = home_ml_cur - home_ml_open
 
-    # Spreads (follow the move; price-only for NHL/MLB run/puck lines)
+    # ── Spreads (follow the move; price-only for NHL/MLB run/puck lines) ────────
     spread = odds.get("pointSpread")
     if spread:
         home_open = parse_point(spread.get("home", {}).get("open", {}).get("line"))
@@ -131,88 +155,168 @@ def collect_market_moves(
         away_cur = parse_point(spread.get("away", {}).get("close", {}).get("line"))
         home_open_price = american_to_prob(spread.get("home", {}).get("open", {}).get("odds"))
         home_cur_price = american_to_prob(spread.get("home", {}).get("close", {}).get("odds"))
+        away_open_price = american_to_prob(spread.get("away", {}).get("open", {}).get("odds"))
+        away_cur_price = american_to_prob(spread.get("away", {}).get("close", {}).get("odds"))
         if None not in (home_open, home_cur, away_open, away_cur):
             # NHL/MLB: spreads rarely move off ±1.5; use price shift primarily.
             if league in {"NHL", "MLB"} and abs(home_open) == 1.5 and abs(home_cur) == 1.5:
                 if home_open_price is not None and home_cur_price is not None:
                     price_delta = home_cur_price - home_open_price
                     if abs(price_delta) >= moneyline_threshold:
+                        base = _score(price_delta, moneyline_threshold)
+                        # Convergence: ML moved the same direction as the price shift.
+                        converge = (
+                            home_ml_delta is not None
+                            and (
+                                (price_delta > 0 and home_ml_delta > 0)
+                                or (price_delta < 0 and home_ml_delta < 0)
+                            )
+                        )
+                        score = min(base + (0.25 if converge else 0.0), 1.0)
                         if price_delta > 0:
-                            picks.append(
-                                f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line"
-                            )
+                            picks.append((
+                                f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line",
+                                score,
+                            ))
                         else:
-                            picks.append(
-                                f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line"
-                            )
+                            picks.append((
+                                f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line",
+                                score,
+                            ))
                 # skip point-based logic for puck/run lines
             else:
                 delta_line = home_cur - home_open
                 delta_mag = abs(home_cur) - abs(home_open)  # toward/away from 0
                 delta = delta_mag
-                # If the line itself didn't move meaningfully, fall back to price shift.
-                price_delta = None
+                price_delta: Optional[float] = None
                 if home_open_price is not None and home_cur_price is not None:
                     price_delta = home_cur_price - home_open_price
+                # Away vig delta used for vig-confirmation bonus.
+                away_price_delta: Optional[float] = None
+                if away_open_price is not None and away_cur_price is not None:
+                    away_price_delta = away_cur_price - away_open_price
+
                 if delta <= -spread_threshold:
-                    picks.append(
-                        f"FOLLOW: {home_team} {home_cur:+} (was {home_open:+}) — line shift {delta_line:+.1f}"
+                    # Home got less favored (or away dog got more valuable) — follow home.
+                    base = _score(delta, spread_threshold)
+                    # Convergence: ML also moved toward home.
+                    converge = home_ml_delta is not None and home_ml_delta > 0
+                    # Vig confirmation: home vig also tightened (home_cur_price rose),
+                    # indicating extra demand-side pressure on home.
+                    vig_confirm = price_delta is not None and price_delta > 0
+                    score = min(
+                        base
+                        + (0.25 if converge else 0.0)
+                        + (0.15 if vig_confirm else 0.0),
+                        1.0,
                     )
+                    picks.append((
+                        f"FOLLOW: {home_team} {home_cur:+} (was {home_open:+}) — line shift {delta_line:+.1f}",
+                        score,
+                    ))
                 elif delta >= spread_threshold:
-                    picks.append(
-                        f"FOLLOW: {away_team} {away_cur:+} (was {away_open:+}) — line shift {delta_line:+.1f}"
+                    # Home got more favored — follow away (dog got more points).
+                    base = _score(delta, spread_threshold)
+                    # Convergence: ML also moved toward away.
+                    converge = home_ml_delta is not None and home_ml_delta < 0
+                    # Vig confirmation: away vig also tightened (away_cur_price rose).
+                    vig_confirm = away_price_delta is not None and away_price_delta > 0
+                    score = min(
+                        base
+                        + (0.25 if converge else 0.0)
+                        + (0.15 if vig_confirm else 0.0),
+                        1.0,
                     )
+                    picks.append((
+                        f"FOLLOW: {away_team} {away_cur:+} (was {away_open:+}) — line shift {delta_line:+.1f}",
+                        score,
+                    ))
                 elif (
                     price_delta is not None
                     and abs(price_delta) >= moneyline_threshold
                     and home_cur == home_open
                 ):
+                    # Line didn't move but juice shifted — price-only steam signal.
+                    base = _score(price_delta, moneyline_threshold)
+                    converge = (
+                        home_ml_delta is not None
+                        and (
+                            (price_delta > 0 and home_ml_delta > 0)
+                            or (price_delta < 0 and home_ml_delta < 0)
+                        )
+                    )
+                    score = min(base + (0.25 if converge else 0.0), 1.0)
                     if price_delta > 0:
-                        picks.append(
-                            f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line"
-                        )
+                        picks.append((
+                            f"FOLLOW: {home_team} {home_cur:+} — price firmed by {price_delta*100:+.1f}pp at same line",
+                            score,
+                        ))
                     else:
-                        picks.append(
-                            f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line"
-                        )
+                        picks.append((
+                            f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line",
+                            score,
+                        ))
 
-    # Totals (follow-the-move)
+    # ── Totals (follow-the-move) ─────────────────────────────────────────────
     total = odds.get("total")
     if total:
         open_point = parse_point(total.get("over", {}).get("open", {}).get("line"))
         cur_point = parse_point(total.get("over", {}).get("close", {}).get("line"))
+        # Track juice direction for vig confirmation.
+        over_open_price = american_to_prob(total.get("over", {}).get("open", {}).get("odds"))
+        over_cur_price = american_to_prob(total.get("over", {}).get("close", {}).get("odds"))
+        under_open_price = american_to_prob(total.get("under", {}).get("open", {}).get("odds"))
+        under_cur_price = american_to_prob(total.get("under", {}).get("close", {}).get("odds"))
         if None not in (open_point, cur_point):
             delta = cur_point - open_point
             if delta >= total_threshold:
-                picks.append(
-                    f"FOLLOW: Over {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}"
+                base = _score(delta, total_threshold)
+                # Vig confirmation: Over vig also tightened (over_cur_price rose).
+                vig_confirm = (
+                    over_open_price is not None
+                    and over_cur_price is not None
+                    and over_cur_price > over_open_price
                 )
+                score = min(base + (0.15 if vig_confirm else 0.0), 1.0)
+                picks.append((
+                    f"FOLLOW: Over {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}",
+                    score,
+                ))
             elif delta <= -total_threshold:
-                picks.append(
-                    f"FOLLOW: Under {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}"
+                base = _score(delta, total_threshold)
+                # Vig confirmation: Under vig also tightened (under_cur_price rose).
+                vig_confirm = (
+                    under_open_price is not None
+                    and under_cur_price is not None
+                    and under_cur_price > under_open_price
                 )
+                score = min(base + (0.15 if vig_confirm else 0.0), 1.0)
+                picks.append((
+                    f"FOLLOW: Under {cur_point:.1f} — total moved {delta:+.1f} from {open_point:.1f}",
+                    score,
+                ))
 
-    # Moneylines (follow-the-move)
-    if moneyline:
-        home_open = american_to_prob(moneyline.get("home", {}).get("open", {}).get("odds"))
-        home_cur = american_to_prob(moneyline.get("home", {}).get("close", {}).get("odds"))
-        away_open = american_to_prob(moneyline.get("away", {}).get("open", {}).get("odds"))
-        away_cur = american_to_prob(moneyline.get("away", {}).get("close", {}).get("odds"))
-        if None not in (home_open, home_cur, away_open, away_cur):
-            delta = home_cur - home_open
-            if delta >= moneyline_threshold:
-                swing = delta * 100
-                picks.append(
-                    f"FOLLOW: {home_team} ML {moneyline.get('home', {}).get('close', {}).get('odds')} "
-                    f"— market boosted home by {swing:+.1f}pp"
-                )
-            elif delta <= -moneyline_threshold:
-                swing = -delta * 100
-                picks.append(
-                    f"FOLLOW: {away_team} ML {moneyline.get('away', {}).get('close', {}).get('odds')} "
-                    f"— market boosted away by {swing:+.1f}pp"
-                )
+    # ── Moneylines (follow-the-move) ─────────────────────────────────────────
+    if moneyline and home_ml_delta is not None:
+        if home_ml_delta >= moneyline_threshold:
+            swing = home_ml_delta * 100
+            score = _score(home_ml_delta, moneyline_threshold)
+            picks.append((
+                f"FOLLOW: {home_team} ML {moneyline.get('home', {}).get('close', {}).get('odds')} "
+                f"— market boosted home by {swing:+.1f}pp",
+                score,
+            ))
+        elif home_ml_delta <= -moneyline_threshold:
+            swing = -home_ml_delta * 100
+            score = _score(home_ml_delta, moneyline_threshold)
+            picks.append((
+                f"FOLLOW: {away_team} ML {moneyline.get('away', {}).get('close', {}).get('odds')} "
+                f"— market boosted away by {swing:+.1f}pp",
+                score,
+            ))
 
+    # Sort descending by confidence so callers always see the best picks first.
+    picks.sort(key=lambda t: t[1], reverse=True)
     return picks
 
 
@@ -322,12 +426,12 @@ def get_market_moves(
     spread_threshold: Optional[float] = None,
     total_threshold: Optional[float] = None,
     moneyline_threshold: Optional[float] = None,
-) -> Dict[str, List[Tuple[Dict, List[str]]]]:
+) -> Dict[str, List[Tuple[Dict, List[Tuple[str, float]]]]]:
     allowed = set(leagues) if leagues else LEAGUE_ALLOWLIST
     html = fetch_odds_page()
     state = extract_state(html)
 
-    league_to_events: Dict[str, List[Tuple[Dict, List[str]]]] = {}
+    league_to_events: Dict[str, List[Tuple[Dict, List[Tuple[str, float]]]]] = {}
     for league, line in iter_events(state):
         if league not in allowed:
             continue
@@ -391,8 +495,9 @@ def main() -> None:
                         + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
                     )
                 print(f"    Injuries: {' | '.join(parts)}")
-            for pick in picks:
-                print(f"    • {pick}")
+            for pick_text, score in picks:
+                label = confidence_label(score)
+                print(f"    • [{label} {score*100:.0f}%] {pick_text}")
 
 
 if __name__ == "__main__":
