@@ -9,15 +9,24 @@ from contrarian import (
     LEAGUE_ALLOWLIST,
     DK_LEAGUE_LINKS,
     collect_market_moves,
+    compute_rest_days,
     confidence_label,
+    evaluate_weather_impact,
     extract_state,
     fetch_action_network,
+    fetch_covers_consensus,
     fetch_injuries,
     fetch_odds_page,
+    fetch_recent_games,
+    fetch_weather,
     get_bet_pcts,
+    get_stadium_coords,
     iso_to_local_text,
     iter_events,
     match_an_game,
+    match_covers_game,
+    parse_game_dt,
+    rest_day_note,
     rlm_signal,
     _normalize_team,
     _pick_team,
@@ -58,8 +67,19 @@ likely driven by sharp (professional) money. This tool flags those games.
 1. Click **Find Contrarian Plays**
 2. Filter by tier (start with LOCK and STRONG only)
 3. Check the injury flags — if an injury explains the move, **skip that game**
-4. If bet % data loads (📡 RLM), prefer plays where public is on the OTHER side
-5. Click **Bet on DraftKings** to go directly to the league on DK
+4. Check **public betting %** (Covers.com) — prefer plays where < 45% of public is on your side (RLM)
+5. Check **weather** (Open-Meteo) for NFL/MLB outdoor games — wind ≥ 15 mph or rain → under lean
+6. Check **rest days** — NBA back-to-backs and NFL short weeks add real edge
+7. Click **Bet on DraftKings** to go directly to the league on DK
+
+### Free data sources used
+| Source | What it provides | Cost |
+|---|---|---|
+| ESPN odds page | Open vs current lines — the core signal | Free (scrape) |
+| Open-Meteo | Weather forecast for outdoor NFL/MLB stadiums | Free, no key |
+| Covers.com | Public betting % (tickets + money per side) | Free (scrape) |
+| ESPN schedule API | Rest days per team (back-to-backs, bye weeks) | Free, no key |
+| ESPN injuries | OUT/DOUBTFUL/QUESTIONABLE players | Free (scrape) |
 
 ### Key rules
 - ✅ Follow moves with no obvious news explanation
@@ -240,6 +260,25 @@ def cached_action_network(sport: str) -> List[dict]:
     return fetch_action_network(sport)
 
 
+@st.cache_data(ttl=300)
+def cached_covers_consensus(league: str) -> List[dict]:
+    """Scrape Covers.com public bet % (free HTML page). Returns [] on failure."""
+    return fetch_covers_consensus(league)
+
+
+@st.cache_data(ttl=600)
+def cached_recent_games(league: str) -> dict:
+    """Fetch ESPN scoreboard for past 8 days to compute rest days. Returns {} on failure."""
+    return fetch_recent_games(league)
+
+
+@st.cache_data(ttl=600)
+def cached_weather(lat: float, lon: float, game_iso: str) -> Optional[dict]:
+    """Fetch Open-Meteo forecast for the given coordinates and game time."""
+    game_dt = parse_game_dt(game_iso)
+    return fetch_weather(lat, lon, game_dt)
+
+
 def game_url(league: str, game_id: str) -> Optional[str]:
     paths = {
         "NBA": "nba",
@@ -358,14 +397,24 @@ if fetch:
             st.stop()
 
     results = {}
-    an_data: Dict[str, List[dict]] = {}  # league → Action Network games
+    an_data: Dict[str, List[dict]] = {}      # league → Action Network games
+    covers_data: Dict[str, List[dict]] = {}  # league → Covers.com consensus
+    recent_games: Dict[str, dict] = {}       # league → team→last_game_dt
 
     if state:
-        # Pre-fetch Action Network data per league (free bet % source)
+        # Pre-fetch all free external data sources in parallel via caching
         for lg in leagues:
+            # Bet % sources (Action Network first, fall back to Covers)
             an_games = cached_action_network(lg)
             if an_games:
                 an_data[lg] = an_games
+            cov = cached_covers_consensus(lg)
+            if cov:
+                covers_data[lg] = cov
+            # Rest-day data (ESPN schedule API — free, no auth)
+            rg = cached_recent_games(lg)
+            if rg:
+                recent_games[lg] = rg
 
         for league, line in iter_events(state):
             if league not in leagues:
@@ -451,7 +500,9 @@ if fetch:
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
                 home_team = home.get("team", {}).get("displayName", "Home")
                 away_team = away.get("team", {}).get("displayName", "Away")
-                start = iso_to_local_text(line.get("date", ""))
+                game_iso  = line.get("date", "")
+                start     = iso_to_local_text(game_iso)
+                game_dt   = parse_game_dt(game_iso)
 
                 st.subheader(f"{away_team} @ {home_team}")
                 st.caption(start)
@@ -464,26 +515,74 @@ if fetch:
                 if dk_link:
                     link_cols[1].caption(f"[Open on DraftKings]({dk_link})")
 
-                # Bet % from Action Network (if available)
-                an_game = match_an_game(home_team, away_team, an_games) if an_games else None
-                bet_pcts = get_bet_pcts(an_game) if an_game else {}
+                # ── Weather (Open-Meteo — completely free, no API key) ───────
+                stadium_coords = get_stadium_coords(home_team, league)
+                weather_note: Optional[str] = None
+                if stadium_coords:
+                    weather = cached_weather(
+                        stadium_coords[0], stadium_coords[1], game_iso
+                    )
+                    weather_note = evaluate_weather_impact(weather)
+                    if weather_note:
+                        st.caption(weather_note)
+                    elif stadium_coords:
+                        # Outdoor stadium but weather is fine — mention it briefly
+                        if weather and weather.get("temp_f") is not None:
+                            wt = weather['temp_f']
+                            ww = weather.get('wind_mph') or 0
+                            st.caption(
+                                f"🌤️ Weather: {wt:.0f}°F, {ww:.0f} mph wind — no impact on total"
+                            )
+
+                # ── Public bet % (Covers.com primary, Action Network fallback) ─
+                c_games = covers_data.get(league, [])
+                a_games = an_data.get(league, [])
+                covers_game = match_covers_game(home_team, away_team, c_games) if c_games else None
+                an_game     = match_an_game(home_team, away_team, a_games) if a_games else None
+
+                bet_pcts: Dict = {}
+                bet_source = ""
+                if covers_game:
+                    # Covers returns home_pct/away_pct directly
+                    bet_pcts = {
+                        "spread_home_pct": covers_game.get("home_pct"),
+                        "spread_away_pct": covers_game.get("away_pct"),
+                        "money_home_pct":  covers_game.get("home_money_pct"),
+                        "money_away_pct":  covers_game.get("away_money_pct"),
+                    }
+                    bet_source = "Covers.com"
+                elif an_game:
+                    bet_pcts = get_bet_pcts(an_game)
+                    bet_source = "Action Network"
+
                 if bet_pcts:
                     pct_parts = []
-                    if bet_pcts.get("spread_home_pct") is not None:
+                    sh = bet_pcts.get("spread_home_pct")
+                    sa = bet_pcts.get("spread_away_pct")
+                    if sh is not None and sa is not None:
                         pct_parts.append(
-                            f"Spread tickets: {home_team} {bet_pcts['spread_home_pct']}% / "
-                            f"{away_team} {bet_pcts['spread_away_pct']}%"
+                            f"Spread: {home_team} **{sh}%** / {away_team} **{sa}%**"
                         )
-                    if bet_pcts.get("over_pct") is not None:
-                        pct_parts.append(
-                            f"O/U tickets: Over {bet_pcts['over_pct']}% / Under {bet_pcts['under_pct']}%"
-                        )
+                    mh = bet_pcts.get("money_home_pct") or bet_pcts.get("money_home_pct")
+                    ma = bet_pcts.get("money_away_pct")
+                    if mh is not None and ma is not None:
+                        pct_parts.append(f"Money: {home_team} {mh}% / {away_team} {ma}%")
+                    ov = bet_pcts.get("over_pct")
+                    un = bet_pcts.get("under_pct")
+                    if ov is not None and un is not None:
+                        pct_parts.append(f"O/U: Over **{ov}%** / Under **{un}%**")
                     if pct_parts:
-                        st.caption("📊 Public Betting: " + " | ".join(pct_parts))
-                elif not an_available:
-                    st.caption("📊 Public betting % not available right now (Action Network offline)")
+                        st.caption(f"📊 Public betting ({bet_source}): " + " | ".join(pct_parts))
 
-                # Injury display
+                # ── Rest days (ESPN schedule API — free, no auth) ─────────────
+                lg_recent = recent_games.get(league, {})
+                for team in (away_team, home_team):
+                    days = compute_rest_days(team, lg_recent, game_dt)
+                    note = rest_day_note(days, league)
+                    if note:
+                        st.caption(f"{team}: {note}")
+
+                # ── Injury display ────────────────────────────────────────────
                 home_inj = league_inj.get(_normalize_team(home_team), [])
                 away_inj = league_inj.get(_normalize_team(away_team), [])
                 inj_rows = [
@@ -494,9 +593,25 @@ if fetch:
                 if inj_rows:
                     st.caption(" | ".join(inj_rows))
 
-                # Picks with RLM and injury cautions
+                # ── Picks with RLM, weather confirmation, and injury cautions ─
                 for pick_text, score in picks:
                     _render_pick(pick_text, score)
+
+                    # Weather confirmation/warning for totals
+                    clean_pick = pick_text.replace("[MULTI-SIGNAL] ", "")
+                    if weather_note and (
+                        clean_pick.startswith("FOLLOW: Under") or
+                        clean_pick.startswith("FOLLOW: Over")
+                    ):
+                        is_under = clean_pick.startswith("FOLLOW: Under")
+                        if is_under and "under lean" in weather_note.lower():
+                            st.caption(
+                                f"✅ Weather CONFIRMS this Under pick: {weather_note}"
+                            )
+                        elif not is_under and "under lean" in weather_note.lower():
+                            st.caption(
+                                f"⚠️ Weather CONFLICTS with this Over pick: {weather_note}"
+                            )
 
                     # Reverse line movement signal
                     rlm = rlm_signal(pick_text, home_team, away_team, bet_pcts)

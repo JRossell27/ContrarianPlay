@@ -66,6 +66,108 @@ KEY_NUMBERS: Dict[str, frozenset] = {
     "NCAAM": frozenset({3, 5, 7}),
 }
 
+# ─── Stadium coordinates for Open-Meteo weather lookups ──────────────────────
+# None = retractable roof or enclosed dome — weather irrelevant for those games
+
+NFL_STADIUM_COORDS: Dict[str, Optional[Tuple[float, float]]] = {
+    "Arizona Cardinals":     None,      # State Farm Stadium — retractable roof
+    "Atlanta Falcons":       None,      # Mercedes-Benz Stadium — dome
+    "Baltimore Ravens":      (39.278, -76.623),
+    "Buffalo Bills":         (42.774, -78.787),
+    "Carolina Panthers":     (35.226, -80.853),
+    "Chicago Bears":         (41.862, -87.617),
+    "Cincinnati Bengals":    (39.095, -84.516),
+    "Cleveland Browns":      (41.506, -81.700),
+    "Dallas Cowboys":        None,      # AT&T Stadium — retractable roof
+    "Denver Broncos":        (39.744, -105.020),
+    "Detroit Lions":         None,      # Ford Field — dome
+    "Green Bay Packers":     (44.501, -88.062),
+    "Houston Texans":        None,      # NRG Stadium — retractable roof
+    "Indianapolis Colts":    None,      # Lucas Oil Stadium — dome
+    "Jacksonville Jaguars":  (30.324, -81.637),
+    "Kansas City Chiefs":    (39.049, -94.484),
+    "Las Vegas Raiders":     None,      # Allegiant Stadium — dome
+    "Los Angeles Chargers":  None,      # SoFi Stadium — canopy roof
+    "Los Angeles Rams":      None,      # SoFi Stadium — canopy roof
+    "Miami Dolphins":        (25.958, -80.239),
+    "Minnesota Vikings":     None,      # U.S. Bank Stadium — dome
+    "New England Patriots":  (42.091, -71.264),
+    "New Orleans Saints":    None,      # Caesars Superdome — dome
+    "New York Giants":       (40.813, -74.074),
+    "New York Jets":         (40.813, -74.074),
+    "Philadelphia Eagles":   (39.901, -75.168),
+    "Pittsburgh Steelers":   (40.447, -80.016),
+    "San Francisco 49ers":   (37.403, -121.970),
+    "Seattle Seahawks":      (47.595, -122.332),
+    "Tampa Bay Buccaneers":  (27.976, -82.503),
+    "Tennessee Titans":      (36.167, -86.771),
+    "Washington Commanders": (38.908, -76.865),
+}
+
+MLB_STADIUM_COORDS: Dict[str, Optional[Tuple[float, float]]] = {
+    "Arizona Diamondbacks":  None,      # Chase Field — retractable roof
+    "Atlanta Braves":        (33.891, -84.468),
+    "Baltimore Orioles":     (39.284, -76.622),
+    "Boston Red Sox":        (42.347, -71.097),
+    "Chicago Cubs":          (41.948, -87.655),
+    "Chicago White Sox":     (41.830, -87.634),
+    "Cincinnati Reds":       (39.097, -84.508),
+    "Cleveland Guardians":   (41.496, -81.685),
+    "Colorado Rockies":      (39.756, -104.994),
+    "Detroit Tigers":        (42.339, -83.049),
+    "Houston Astros":        None,      # Minute Maid Park — retractable roof
+    "Kansas City Royals":    (39.052, -94.480),
+    "Los Angeles Angels":    (33.800, -117.883),
+    "Los Angeles Dodgers":   (34.074, -118.240),
+    "Miami Marlins":         None,      # loanDepot park — retractable roof
+    "Milwaukee Brewers":     (43.028, -87.971),
+    "Minnesota Twins":       (44.982, -93.278),
+    "New York Mets":         (40.757, -73.846),
+    "New York Yankees":      (40.830, -73.926),
+    "Oakland Athletics":     (37.752, -122.201),
+    "Philadelphia Phillies": (39.906, -75.167),
+    "Pittsburgh Pirates":    (40.447, -80.006),
+    "San Diego Padres":      (32.708, -117.157),
+    "San Francisco Giants":  (37.779, -122.389),
+    "Seattle Mariners":      None,      # T-Mobile Park — retractable roof
+    "St. Louis Cardinals":   (38.623, -90.193),
+    "Tampa Bay Rays":        None,      # Tropicana Field — dome
+    "Texas Rangers":         None,      # Globe Life Field — retractable roof
+    "Toronto Blue Jays":     None,      # Rogers Centre — dome
+    "Washington Nationals":  (38.873, -77.007),
+}
+
+# WMO weather codes indicating precipitation
+_PRECIP_CODES = frozenset({
+    51, 53, 55,       # Drizzle
+    61, 63, 65,       # Rain
+    71, 73, 75, 77,   # Snow / snow grains
+    80, 81, 82,       # Rain showers
+    85, 86,           # Snow showers
+    95, 96, 99,       # Thunderstorm
+})
+_SNOW_CODES = frozenset({71, 73, 75, 77, 85, 86})
+
+# Covers.com sport codes
+COVERS_SPORT_MAP: Dict[str, str] = {
+    "NFL":   "nfl",
+    "NBA":   "nba",
+    "MLB":   "mlb",
+    "NCAAF": "ncaaf",
+    "NCAAM": "ncaab",
+    "NHL":   "nhl",
+}
+
+# ESPN sport/league path pairs for schedule + scoreboard lookups
+ESPN_SPORT_PATHS: Dict[str, Tuple[str, str]] = {
+    "NFL":   ("football",    "nfl"),
+    "NBA":   ("basketball",  "nba"),
+    "NHL":   ("hockey",      "nhl"),
+    "MLB":   ("baseball",    "mlb"),
+    "NCAAF": ("football",    "college-football"),
+    "NCAAM": ("basketball",  "mens-college-basketball"),
+}
+
 # Browser-like headers for scraping
 _HEADERS = {
     "User-Agent": (
@@ -210,6 +312,409 @@ def fetch_action_network(sport: str, date_str: Optional[str] = None) -> List[Dic
         return resp.json().get("games", [])
     except Exception:
         return []
+
+
+# ─── Open-Meteo weather (completely free, no API key) ─────────────────────────
+
+def get_stadium_coords(
+    home_team: str, league: str
+) -> Optional[Tuple[float, float]]:
+    """Return outdoor stadium (lat, lon) for home team, or None if indoor/dome."""
+    if league == "NFL":
+        return NFL_STADIUM_COORDS.get(home_team)
+    if league == "MLB":
+        return MLB_STADIUM_COORDS.get(home_team)
+    # NCAAF: nearly all outdoor, but we lack a full college stadium DB — skip
+    return None
+
+
+def parse_game_dt(iso_str: str) -> Optional[datetime]:
+    """Parse an ESPN ISO timestamp to a UTC-aware datetime."""
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def fetch_weather(
+    lat: float, lon: float, game_dt: Optional[datetime] = None
+) -> Optional[Dict]:
+    """Fetch weather forecast from Open-Meteo.
+
+    Open-Meteo is 100% free with no API key: https://open-meteo.com/
+    10,000 calls/day limit, 7-day hourly forecasts.
+
+    Returns a dict with temp_f, wind_mph, wind_dir, precipitation_in,
+    weather_code — all at the game's scheduled hour. Returns None on failure.
+    """
+    params = {
+        "latitude":          round(lat, 4),
+        "longitude":         round(lon, 4),
+        "current_weather":   "true",
+        "hourly":            "temperature_2m,windspeed_10m,winddirection_10m,precipitation,weathercode",
+        "temperature_unit":  "fahrenheit",
+        "windspeed_unit":    "mph",
+        "precipitation_unit": "inch",
+        "forecast_days":     7,
+        "timezone":          "auto",
+    }
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params,
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+
+    hourly = data.get("hourly", {})
+    times  = hourly.get("time", [])
+
+    def _at(field: str, idx: int):
+        vals = hourly.get(field, [])
+        return vals[idx] if 0 <= idx < len(vals) else None
+
+    if game_dt and times:
+        game_utc = game_dt.astimezone(timezone.utc)
+        best_idx, best_diff = 0, float("inf")
+        for i, t_str in enumerate(times):
+            try:
+                t = datetime.fromisoformat(t_str)
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                diff = abs((t.astimezone(timezone.utc) - game_utc).total_seconds())
+                if diff < best_diff:
+                    best_diff, best_idx = diff, i
+            except Exception:
+                continue
+        idx = best_idx
+    elif times:
+        idx = 0
+    else:
+        cw = data.get("current_weather", {})
+        return {
+            "temp_f":          cw.get("temperature"),
+            "wind_mph":        cw.get("windspeed"),
+            "wind_dir":        cw.get("winddirection"),
+            "precipitation_in": None,
+            "weather_code":    cw.get("weathercode"),
+        }
+
+    return {
+        "temp_f":          _at("temperature_2m",    idx),
+        "wind_mph":        _at("windspeed_10m",     idx),
+        "wind_dir":        _at("winddirection_10m", idx),
+        "precipitation_in": _at("precipitation",   idx),
+        "weather_code":    _at("weathercode",       idx),
+    }
+
+
+def evaluate_weather_impact(weather: Optional[Dict]) -> Optional[str]:
+    """Assess weather conditions and return a betting-relevant description.
+
+    Research-backed thresholds for NFL totals:
+      Wind ≥ 15 mph  → −0.5 to −1.0 pts on average total
+      Wind ≥ 20 mph  → −1.5 to −2.5 pts
+      Wind ≥ 25 mph  → −3+ pts (historically game-changing)
+      Rain/snow      → additional −1 to −2 pts
+      Temp ≤ 25 °F   → additional −1 to −1.5 pts
+
+    Returns a short string for display, or None if conditions are neutral.
+    """
+    if not weather:
+        return None
+
+    wind  = weather.get("wind_mph") or 0.0
+    temp  = weather.get("temp_f")
+    precip = weather.get("precipitation_in") or 0.0
+    code  = weather.get("weather_code") or 0
+
+    factors: List[str] = []
+    score = 0  # higher = stronger under lean
+
+    if wind >= 25:
+        factors.append(f"💨 {wind:.0f} mph wind")
+        score += 3
+    elif wind >= 20:
+        factors.append(f"💨 {wind:.0f} mph wind")
+        score += 2
+    elif wind >= 15:
+        factors.append(f"💨 {wind:.0f} mph wind")
+        score += 1
+
+    is_snow = code in _SNOW_CODES
+    has_precip = precip >= 0.05 or code in _PRECIP_CODES
+    if is_snow:
+        factors.append("❄️ snow")
+        score += 3
+    elif has_precip:
+        factors.append("🌧️ rain")
+        score += 2
+
+    if temp is not None:
+        if temp <= 10:
+            factors.append(f"🥶 {temp:.0f}°F")
+            score += 3
+        elif temp <= 25:
+            factors.append(f"❄️ {temp:.0f}°F")
+            score += 2
+        elif temp <= 35:
+            factors.append(f"🌡️ {temp:.0f}°F")
+            score += 1
+
+    if not factors:
+        return None   # clear, mild, no impact
+
+    if score >= 5:
+        lean = "STRONG under lean"
+    elif score >= 3:
+        lean = "moderate under lean"
+    elif score >= 1:
+        lean = "mild under lean"
+    else:
+        return None
+
+    return f"🌦️ Weather: {', '.join(factors)} → {lean}"
+
+
+# ─── Covers.com public betting consensus (free, no API key) ────────────────────
+
+def fetch_covers_consensus(league: str) -> List[Dict]:
+    """Scrape public betting percentages from Covers.com consensus page.
+
+    URL pattern: https://contests.covers.com/consensus/topconsensus/{sport}/overall
+    Free HTML page — no account or API key required.
+
+    Returns list of dicts with keys:
+      home_team, away_team, home_pct (int 0-100), away_pct,
+      home_money_pct, away_money_pct  — any may be None.
+    Returns [] silently on any failure.
+    """
+    sport = COVERS_SPORT_MAP.get(league)
+    if not sport:
+        return []
+
+    url = f"https://contests.covers.com/consensus/topconsensus/{sport}/overall"
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        return []
+
+    # Strategy 1: look for embedded JSON in <script> tags (React/Next.js SPAs)
+    for pattern in (
+        r"window\.__NEXT_DATA__\s*=\s*(\{.*?\})\s*;",
+        r"window\.__data\s*=\s*(\{.*?\})\s*;",
+        r"window\.consensus_data\s*=\s*(\{.*?\})\s*;",
+    ):
+        m = re.search(pattern, html, re.DOTALL)
+        if m:
+            try:
+                result = _parse_covers_json(json.loads(m.group(1)))
+                if result:
+                    return result
+            except Exception:
+                pass
+
+    # Strategy 2: parse HTML tables/divs
+    return _parse_covers_html(html)
+
+
+def _pct_int(val) -> Optional[int]:
+    """Convert '65%', 0.65, or 65 → int 65. Returns None on failure."""
+    if val is None:
+        return None
+    try:
+        s = str(val).replace("%", "").strip()
+        f = float(s)
+        if 0.0 < f <= 1.0:
+            f *= 100
+        return int(round(f))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_covers_json(data: Dict) -> List[Dict]:
+    """Try to extract game consensus data from Covers.com embedded JSON."""
+    games = []
+    for container_key in ("games", "matchups", "consensus", "events", "picks", "data"):
+        items = data.get(container_key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            try:
+                home = item.get("homeTeam") or item.get("home_team") or {}
+                away = item.get("awayTeam") or item.get("away_team") or {}
+                home_name = (home.get("fullName") or home.get("displayName")
+                             or home.get("name") or "")
+                away_name = (away.get("fullName") or away.get("displayName")
+                             or away.get("name") or "")
+                if not home_name or not away_name:
+                    continue
+                con = item.get("consensus") or item.get("spreadConsensus") or {}
+                games.append({
+                    "home_team":      home_name,
+                    "away_team":      away_name,
+                    "home_pct":       _pct_int(con.get("homePct")    or home.get("spreadPct") or home.get("ticketPct")),
+                    "away_pct":       _pct_int(con.get("awayPct")    or away.get("spreadPct") or away.get("ticketPct")),
+                    "home_money_pct": _pct_int(con.get("homeMoneyPct") or home.get("moneyPct")),
+                    "away_money_pct": _pct_int(con.get("awayMoneyPct") or away.get("moneyPct")),
+                })
+            except Exception:
+                continue
+    return games
+
+
+def _parse_covers_html(html: str) -> List[Dict]:
+    """Parse Covers consensus HTML tables/divs with BeautifulSoup."""
+    soup = BeautifulSoup(html, "html.parser")
+    games: List[Dict] = []
+
+    # Strategy A: HTML tables — Covers renders game rows in tables on some layouts
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr")[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            pcts  = [c for c in cells if re.match(r"^\d{1,3}%$", c)]
+            if len(pcts) < 2:
+                continue
+            teams = [c for c in cells[:4]
+                     if c and len(c) > 2 and not re.match(r"^[\d%+\-./: ]+$", c)]
+            if len(teams) < 2:
+                continue
+            games.append({
+                "away_team":      teams[0],
+                "home_team":      teams[1],
+                "away_pct":       _pct_int(pcts[0]),
+                "home_pct":       _pct_int(pcts[1]),
+                "away_money_pct": _pct_int(pcts[2]) if len(pcts) > 2 else None,
+                "home_money_pct": _pct_int(pcts[3]) if len(pcts) > 3 else None,
+            })
+    if games:
+        return games
+
+    # Strategy B: div-based layout (React components often render % in spans)
+    for div in soup.find_all("div", class_=re.compile(
+        r"matchup|consensus|pick|game-row|game-item|event-row", re.I
+    )):
+        texts = [s.strip() for s in div.strings if s.strip()]
+        pcts  = [_pct_int(t) for t in texts if re.match(r"^\d{1,3}%$", t)]
+        teams = [t for t in texts
+                 if t and len(t) > 2 and not re.match(r"^[\d%+\-./: ]+$", t)]
+        if len(pcts) >= 2 and len(teams) >= 2:
+            games.append({
+                "away_team":      teams[0],
+                "home_team":      teams[1],
+                "away_pct":       pcts[0],
+                "home_pct":       pcts[1],
+                "away_money_pct": pcts[2] if len(pcts) > 2 else None,
+                "home_money_pct": pcts[3] if len(pcts) > 3 else None,
+            })
+    return games
+
+
+def match_covers_game(
+    home_team: str, away_team: str, covers_games: List[Dict]
+) -> Optional[Dict]:
+    """Match an ESPN game to a Covers consensus entry by fuzzy team name."""
+    home_norm = _normalize_team(home_team)
+    away_norm = _normalize_team(away_team)
+    for g in covers_games:
+        c_home = _normalize_team(g.get("home_team", ""))
+        c_away = _normalize_team(g.get("away_team", ""))
+        home_ok = (home_norm in c_home or c_home in home_norm
+                   or (home_norm.split() and home_norm.split()[-1] in c_home))
+        away_ok = (away_norm in c_away or c_away in away_norm
+                   or (away_norm.split() and away_norm.split()[-1] in c_away))
+        if home_ok and away_ok:
+            return g
+    return None
+
+
+# ─── ESPN schedule API for rest-day context (free, no auth) ───────────────────
+
+def fetch_recent_games(league: str, days_back: int = 8) -> Dict[str, datetime]:
+    """Scan ESPN scoreboard for the past N days to find each team's last game date.
+
+    Uses: https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard
+    Free, no authentication required.
+
+    Returns: normalized_team_name → last_game_datetime (UTC-aware).
+    """
+    path = ESPN_SPORT_PATHS.get(league)
+    if not path:
+        return {}
+    sport, league_code = path
+    team_last: Dict[str, datetime] = {}
+
+    for delta in range(1, days_back + 1):
+        date_str = (datetime.now(timezone.utc) - timedelta(days=delta)).strftime("%Y%m%d")
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports"
+            f"/{sport}/{league_code}/scoreboard?dates={date_str}&limit=100"
+        )
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=8)
+            if not resp.ok:
+                continue
+            data = resp.json()
+        except Exception:
+            continue
+
+        for event in data.get("events", []):
+            try:
+                gdt = datetime.fromisoformat(
+                    event.get("date", "").replace("Z", "+00:00")
+                )
+            except Exception:
+                continue
+            comps = (event.get("competitions") or [{}])[0]
+            for ct in comps.get("competitors", []):
+                t_info = ct.get("team", {})
+                name = _normalize_team(
+                    t_info.get("displayName") or t_info.get("name") or ""
+                )
+                if name and (name not in team_last or gdt > team_last[name]):
+                    team_last[name] = gdt
+
+    return team_last
+
+
+def compute_rest_days(
+    team_name: str,
+    last_games: Dict[str, datetime],
+    game_dt: Optional[datetime],
+) -> Optional[int]:
+    """Return integer days of rest before the current game, or None if unknown."""
+    if not game_dt or not last_games:
+        return None
+    last = last_games.get(_normalize_team(team_name))
+    if last is None:
+        return None
+    delta = game_dt.astimezone(timezone.utc) - last.astimezone(timezone.utc)
+    return max(0, delta.days)
+
+
+def rest_day_note(days: Optional[int], league: str) -> Optional[str]:
+    """Return a betting-relevant note about rest days, or None if unremarkable."""
+    if days is None:
+        return None
+    if league in ("NBA", "NCAAM"):
+        if days <= 1:
+            return f"😴 Back-to-back ({days}d rest) — teams cover spread less often on B2B"
+        if days >= 5:
+            return f"✨ {days} days rest — well-rested, small performance edge"
+    elif league in ("NFL", "NCAAF"):
+        if days <= 4:
+            return f"⚡ Short week ({days}d rest) — injury risk up, performance historically dips"
+        if days >= 13:
+            return f"✨ Coming off bye ({days}d rest) — bye-week prep edge historically ~+1.5 pts"
+    elif league == "MLB":
+        if days == 0:
+            return "⚠️ Double-header or unusual scheduling"
+    return None
 
 
 def match_an_game(
