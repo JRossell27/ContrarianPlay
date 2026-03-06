@@ -3,6 +3,7 @@ import streamlit as st
 from contrarian import (
     LEAGUE_ALLOWLIST,
     collect_market_moves,
+    confidence_label,
     extract_state,
     fetch_injuries,
     fetch_odds_page,
@@ -32,9 +33,23 @@ with st.expander("How to read the signals (quick rules)"):
 - ✅ Follow the move unless news explains it: Total ↓ → Under; favorite cheaper → underdog; ML favorite cheaper → look at dog.
 - ⚠️ Contrarian requires no obvious news: if injury/goalie/pitcher explains the move, pass.
 - ⚠️ Freezes/reversals matter: popular side not moving or a snap-back late can flip the lean.
-- ❌ If you can’t explain the bet in one sentence (“Line moved ___ with no news, book protecting ___”), pass.
+- ❌ If you can't explain the bet in one sentence ("Line moved ___ with no news, book protecting ___"), pass.
+- 🔒 **LOCK (≥75%)** — spread + ML convergence or large magnitude move (highest confidence).
+- ⚡ **STRONG (50–74%)** — meaningful move with partial confirmation.
+- ✅ **LEAN (25–49%)** — threshold met but single signal only.
+- 👁 **WATCH (<25%)** — borderline; treat as informational only.
         """
     )
+
+
+def _pick_icon(score: float) -> str:
+    if score >= 0.75:
+        return "🔒"
+    if score >= 0.50:
+        return "⚡"
+    if score >= 0.25:
+        return "✅"
+    return "👁"
 
 
 @st.cache_data(ttl=300)
@@ -61,10 +76,6 @@ def game_url(league: str, game_id: str) -> Optional[str]:
     if path and game_id:
         return f"https://www.espn.com/{path}/game/_/gameId/{game_id}"
     return None
-
-
-def _normalize_team(name: str) -> str:
-    return name.lower().replace(".", "").replace("'", "").strip()
 
 
 @st.cache_data(ttl=3600)
@@ -128,42 +139,6 @@ def fetch_team_stats(league: str):
             continue
     return stats
 
-
-@st.cache_data(ttl=900)
-def fetch_injuries(league: str):
-    urls = {
-        "NBA": "https://www.espn.com/nba/injuries",
-        "NFL": "https://www.espn.com/nfl/injuries",
-        "NHL": "https://www.espn.com/nhl/injuries",
-        "MLB": "https://www.espn.com/mlb/injuries",
-        "NCAAF": "https://www.espn.com/college-football/injuries",
-        "NCAAM": "https://www.espn.com/mens-college-basketball/injuries",
-    }
-    url = urls.get(league)
-    if not url:
-        return {}
-    try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-    except Exception:
-        return {}
-    soup = BeautifulSoup(resp.text, "html.parser")
-    result = {}
-    for section in soup.find_all("section"):
-        header = section.find("h2")
-        table = section.find("table")
-        if not header or not table:
-            continue
-        team_name = header.get_text(strip=True)
-        rows = []
-        for tr in table.find_all("tr")[1:]:
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) >= 5:
-                player, pos, date, injury, status = tds[:5]
-                rows.append({"player": player, "pos": pos, "status": status, "injury": injury})
-        if rows:
-            result[_normalize_team(team_name)] = rows
-    return result
 
 col1, col2, col3, col4 = st.columns([1.2, 1, 1, 1])
 with col1:
@@ -244,8 +219,11 @@ if fetch:
                             + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
                         )
                     st.caption(" | ".join(txt))
-                for pick in picks:
-                    st.markdown(f"- {pick}")
+                # picks are sorted by score descending; display with confidence icon.
+                for pick_text, score in picks:
+                    icon = _pick_icon(score)
+                    label = confidence_label(score)
+                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
                 st.divider()
 
 if fetch and state:
@@ -262,10 +240,10 @@ if fetch and state:
         "MLB": 1.5,
     }
     cols = st.columns(3)
-    nba_thresh = cols[0].slider("NBA / NCAAM total move ≥ (pts)", 0.5, 6.0, defaults["NBA"], 0.5)
-    nhl_thresh = cols[1].slider("NHL total move ≥ (pts)", 0.25, 3.0, defaults["NHL"], 0.25)
-    nfl_thresh = cols[2].slider("NFL / NCAAF total move ≥ (pts)", 0.5, 8.0, defaults["NFL"], 0.5)
-    mlb_thresh = st.slider("MLB total move ≥ (pts)", 0.5, 5.0, defaults["MLB"], 0.5)
+    nba_thresh = cols[0].slider("NBA / NCAAM total move ≥ (pts)", 0.5, 6.0, defaults["NBA"], 0.5, key="totals_nba")
+    nhl_thresh = cols[1].slider("NHL total move ≥ (pts)", 0.25, 3.0, defaults["NHL"], 0.25, key="totals_nhl")
+    nfl_thresh = cols[2].slider("NFL / NCAAF total move ≥ (pts)", 0.5, 8.0, defaults["NFL"], 0.5, key="totals_nfl")
+    mlb_thresh = st.slider("MLB total move ≥ (pts)", 0.5, 5.0, defaults["MLB"], 0.5, key="totals_mlb")
 
     sport_total_thresholds = {
         "NBA": nba_thresh,
@@ -287,7 +265,11 @@ if fetch and state:
             total_threshold=sport_total_thresholds[league],
             moneyline_threshold=1.0,  # disable ML
         )
-        total_picks = [p for p in picks if p.startswith("FOLLOW: Over") or p.startswith("FOLLOW: Under")]
+        total_picks = [
+            (text, score)
+            for text, score in picks
+            if text.startswith("FOLLOW: Over") or text.startswith("FOLLOW: Under")
+        ]
         if total_picks:
             totals_results.setdefault(league, []).append((line, total_picks, league_inj))
 
@@ -304,10 +286,8 @@ if fetch and state:
                 away_team = away.get("team", {}).get("displayName", "Away")
                 start = iso_to_local_text(line.get("date", ""))
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
-                home_inj = game_inj.get(_normalize_team(home_team), []) or league_inj.get(_normalize_team(home_team), [])
-                away_inj = game_inj.get(_normalize_team(away_team), []) or league_inj.get(_normalize_team(away_team), [])
-                home_inj = home_inj[:3]
-                away_inj = away_inj[:3]
+                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
+                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
                 if home_inj or away_inj:
                     txt = []
                     if away_inj:
@@ -321,11 +301,13 @@ if fetch and state:
                             + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
                         )
                     st.caption(" | ".join(txt))
-                for pick in picks:
-                    st.markdown(f"- {pick}")
+                for pick_text, score in picks:
+                    icon = _pick_icon(score)
+                    label = confidence_label(score)
+                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
                 st.divider()
 else:
-    st.info("Set your thresholds and click “Find contrarian plays”.")
+    st.info("Set your thresholds and click "Find contrarian plays".")
 
 # --- Totals + context page ---
 
@@ -344,10 +326,10 @@ defaults = {
     "MLB": 1.5,
 }
 cols = st.columns(3)
-nba_thresh = cols[0].slider("NBA / NCAAM total move ≥ (pts)", 0.5, 6.0, defaults["NBA"], 0.5)
-nhl_thresh = cols[1].slider("NHL total move ≥ (pts)", 0.25, 3.0, defaults["NHL"], 0.25)
-nfl_thresh = cols[2].slider("NFL / NCAAF total move ≥ (pts)", 0.5, 8.0, defaults["NFL"], 0.5)
-mlb_thresh = st.slider("MLB total move ≥ (pts)", 0.5, 5.0, defaults["MLB"], 0.5)
+nba_thresh_ctx = cols[0].slider("NBA / NCAAM total move ≥ (pts)", 0.5, 6.0, defaults["NBA"], 0.5, key="ctx_nba")
+nhl_thresh_ctx = cols[1].slider("NHL total move ≥ (pts)", 0.25, 3.0, defaults["NHL"], 0.25, key="ctx_nhl")
+nfl_thresh_ctx = cols[2].slider("NFL / NCAAF total move ≥ (pts)", 0.5, 8.0, defaults["NFL"], 0.5, key="ctx_nfl")
+mlb_thresh_ctx = st.slider("MLB total move ≥ (pts)", 0.5, 5.0, defaults["MLB"], 0.5, key="ctx_mlb")
 
 if st.button("Find totals with context"):
     with st.spinner("Fetching odds, stats, and injuries..."):
@@ -362,39 +344,43 @@ if st.button("Find totals with context"):
         stats_cache = {lg: fetch_team_stats(lg) for lg in leagues_seen}
         inj_cache = {lg: fetch_injuries(lg) for lg in leagues_seen}
 
-    totals_results = {}
-    sport_total_thresholds = {
-        "NBA": nba_thresh,
-        "NCAAM": nba_thresh,
-        "NHL": nhl_thresh,
-        "NFL": nfl_thresh,
-        "NCAAF": nfl_thresh,
-        "MLB": mlb_thresh,
+    totals_results_ctx = {}
+    sport_total_thresholds_ctx = {
+        "NBA": nba_thresh_ctx,
+        "NCAAM": nba_thresh_ctx,
+        "NHL": nhl_thresh_ctx,
+        "NFL": nfl_thresh_ctx,
+        "NCAAF": nfl_thresh_ctx,
+        "MLB": mlb_thresh_ctx,
     }
 
     for league, line in iter_events(state):
-        if league not in sport_total_thresholds:
+        if league not in sport_total_thresholds_ctx:
             continue
         league_inj = inj_cache.get(league, {})
         picks = collect_market_moves(
             league,
             line,
             spread_threshold=1e6,  # disable spread
-            total_threshold=sport_total_thresholds[league],
+            total_threshold=sport_total_thresholds_ctx[league],
             moneyline_threshold=1.0,  # disable ML
         )
-        total_picks = [p for p in picks if p.startswith("FOLLOW: Over") or p.startswith("FOLLOW: Under")]
+        total_picks = [
+            (text, score)
+            for text, score in picks
+            if text.startswith("FOLLOW: Over") or text.startswith("FOLLOW: Under")
+        ]
         if total_picks:
-            totals_results.setdefault(league, []).append((line, total_picks, league_inj, game_inj))
+            totals_results_ctx.setdefault(league, []).append((line, total_picks, league_inj))
 
-    if not totals_results:
+    if not totals_results_ctx:
         st.info("No totals moves met the sport-specific thresholds.")
     else:
-        for league in sorted(totals_results.keys()):
+        for league in sorted(totals_results_ctx.keys()):
             st.subheader(league)
             stats = stats_cache.get(league, {})
             injuries = inj_cache.get(league, {})
-            for line, picks in totals_results[league]:
+            for line, picks, league_inj in totals_results_ctx[league]:
                 competitors = line.get("competitors", [])
                 home = next((c for c in competitors if c.get("homeAway") == "home"), {})
                 away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -403,8 +389,10 @@ if st.button("Find totals with context"):
                 start = iso_to_local_text(line.get("date", ""))
 
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
-                for pick in picks:
-                    st.markdown(f"- {pick}")
+                for pick_text, score in picks:
+                    icon = _pick_icon(score)
+                    label = confidence_label(score)
+                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
 
                 # Attach quick stats
                 home_stats = stats.get(_normalize_team(home_team), {})
@@ -436,7 +424,8 @@ if st.button("Find totals with context"):
                         )
                     st.caption(" | ".join(txt))
 
-                # Simple recommendation tag
-                rec = "Lean Over" if any(p.startswith("FOLLOW: Over") for p in picks) else "Lean Under"
+                # Simple recommendation tag based on highest-confidence pick.
+                best_pick_text = picks[0][0]  # already sorted by score desc
+                rec = "Lean Over" if best_pick_text.startswith("FOLLOW: Over") else "Lean Under"
                 st.badge(rec)
                 st.divider()
