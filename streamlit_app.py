@@ -319,7 +319,7 @@ if fetch and state:
                     _render_pick(pick_text, score)
                 st.divider()
 else:
-    st.info("Set your thresholds and click "Find contrarian plays".")
+    st.info('Set your thresholds and click "Find contrarian plays".')
 
 # --- Totals + context page ---
 
