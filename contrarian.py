@@ -1,7 +1,7 @@
 import argparse
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -18,18 +18,47 @@ LEAGUE_ALLOWLIST = {
     "NCAAM",
 }  # NCAAM = men's college basketball on ESPN
 
+# DraftKings league page links (static — always current)
+DK_LEAGUE_LINKS: Dict[str, str] = {
+    "NBA":   "https://sportsbook.draftkings.com/leagues/basketball/nba",
+    "NFL":   "https://sportsbook.draftkings.com/leagues/football/nfl",
+    "NHL":   "https://sportsbook.draftkings.com/leagues/hockey/nhl",
+    "MLB":   "https://sportsbook.draftkings.com/leagues/baseball/mlb",
+    "NCAAM": "https://sportsbook.draftkings.com/leagues/basketball/ncaab",
+    "NCAAF": "https://sportsbook.draftkings.com/leagues/football/college-football",
+}
+
+# DraftKings internal league IDs (used for their public sportsbook API)
+DK_LEAGUE_IDS: Dict[str, int] = {
+    "NBA":   42648,
+    "NFL":   88808,
+    "NHL":   42133,
+    "MLB":   84240,
+    "NCAAM": 92483,
+    "NCAAF": 87637,
+}
+
+# Action Network sport codes (for their free public bet % API)
+AN_SPORT_MAP: Dict[str, str] = {
+    "NBA":   "nba",
+    "NFL":   "nfl",
+    "NHL":   "nhl",
+    "MLB":   "mlb",
+    "NCAAM": "ncaab",
+    "NCAAF": "ncaaf",
+}
+
 # Sport-specific defaults to avoid over/under-filtering moves.
 SPORT_DEFAULTS = {
     "NBA": {"spread": 1.0, "total": 1.5, "ml_prob": 0.05},
     "NCAAM": {"spread": 1.0, "total": 1.5, "ml_prob": 0.05},
     "NFL": {"spread": 0.5, "total": 1.5, "ml_prob": 0.04},
     "NCAAF": {"spread": 0.5, "total": 1.5, "ml_prob": 0.04},
-    "NHL": {"spread": 1.0, "total": 0.5, "ml_prob": 0.04},  # puck line mostly ±1.5; total moves in goals
-    "MLB": {"spread": 1.0, "total": 1.0, "ml_prob": 0.04},  # run line ±1.5; totals tighter
+    "NHL": {"spread": 1.0, "total": 0.5, "ml_prob": 0.04},
+    "MLB": {"spread": 1.0, "total": 1.0, "ml_prob": 0.04},
 }
 
 # Key numbers: moves crossing these thresholds are disproportionately significant
-# because a large share of games land on these margins (field goals, touchdowns, etc.).
 KEY_NUMBERS: Dict[str, frozenset] = {
     "NFL":   frozenset({3, 6, 7, 10, 14}),
     "NCAAF": frozenset({3, 6, 7, 10, 14}),
@@ -37,10 +66,20 @@ KEY_NUMBERS: Dict[str, frozenset] = {
     "NCAAM": frozenset({3, 5, 7}),
 }
 
+# Browser-like headers for scraping
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def fetch_odds_page() -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(ESPN_ODDS_URL, headers=headers, timeout=30)
+    resp = requests.get(ESPN_ODDS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     resp.raise_for_status()
     return resp.text
 
@@ -77,9 +116,22 @@ def parse_point(line: Optional[str]) -> Optional[float]:
 
 
 def iso_to_local_text(iso_str: str) -> str:
+    """Convert ISO timestamp to a readable ET string with Today/Tomorrow prefix."""
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %I:%M %p UTC")
+        # Convert to US Eastern time (UTC-5 standard, UTC-4 daylight — approximate)
+        et_offset = timedelta(hours=-5)
+        dt_et = dt + et_offset
+        now_et = datetime.now(timezone.utc) + et_offset
+
+        if dt_et.date() == now_et.date():
+            day_label = "Today"
+        elif dt_et.date() == (now_et + timedelta(days=1)).date():
+            day_label = "Tomorrow"
+        else:
+            day_label = dt_et.strftime("%a %b %-d")
+
+        return f"{day_label} {dt_et.strftime('%-I:%M %p')} ET"
     except Exception:
         return iso_str
 
@@ -94,7 +146,11 @@ def _score(delta: float, threshold: float) -> float:
 
 
 def confidence_label(score: float) -> str:
-    """Human-readable confidence tier for a pick score."""
+    """Human-readable signal-strength tier for a pick score.
+
+    These tiers describe how many independent signals agree and how large the
+    move was — NOT a probability of winning the bet.
+    """
     if score >= 0.75:
         return "LOCK"
     if score >= 0.50:
@@ -105,12 +161,6 @@ def confidence_label(score: float) -> str:
 
 
 def _crosses_key_number(open_val: float, cur_val: float, league: str) -> bool:
-    """Return True if the spread move crossed a key landing number for the sport.
-
-    NFL/NCAAF key numbers (3, 6, 7, 10, 14) reflect common scoring margins.
-    NBA/NCAAM key numbers (3, 5, 7) reflect common winning margins in basketball.
-    A move that crosses one of these is disproportionately significant.
-    """
     keys = KEY_NUMBERS.get(league, frozenset())
     if not keys:
         return False
@@ -137,6 +187,213 @@ def iter_events(state: Dict) -> Iterable[Tuple[str, Dict]]:
             yield league, line
 
 
+# ─── Free external data sources ──────────────────────────────────────────────
+
+def fetch_action_network(sport: str, date_str: Optional[str] = None) -> List[Dict]:
+    """Fetch public bet % data from Action Network (free — no API key needed).
+
+    sport:    ESPN league code (NBA, NFL, etc.)
+    date_str: YYYYMMDD string; defaults to today.
+
+    Returns list of game dicts, each potentially containing bet % fields.
+    Returns [] silently if the request fails or the API is unavailable.
+    """
+    an_sport = AN_SPORT_MAP.get(sport)
+    if not an_sport:
+        return []
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    url = f"https://api.actionnetwork.com/web/v1/games?sport={an_sport}&date={date_str}"
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("games", [])
+    except Exception:
+        return []
+
+
+def match_an_game(
+    home_team: str, away_team: str, an_games: List[Dict]
+) -> Optional[Dict]:
+    """Try to match an ESPN game to an Action Network game by fuzzy team name."""
+    home_norm = _normalize_team(home_team)
+    away_norm = _normalize_team(away_team)
+    for game in an_games:
+        ht = game.get("home_team") or {}
+        at = game.get("away_team") or {}
+        an_home = _normalize_team(
+            ht.get("full_name") or ht.get("name") or ht.get("abbr") or ""
+        )
+        an_away = _normalize_team(
+            at.get("full_name") or at.get("name") or at.get("abbr") or ""
+        )
+        home_match = home_norm in an_home or an_home in home_norm or (
+            len(home_norm) >= 4 and home_norm[-4:] in an_home
+        )
+        away_match = away_norm in an_away or an_away in away_norm or (
+            len(away_norm) >= 4 and away_norm[-4:] in an_away
+        )
+        if home_match and away_match:
+            return game
+    return None
+
+
+def get_bet_pcts(an_game: Optional[Dict]) -> Dict[str, Optional[int]]:
+    """Extract public betting percentages from an Action Network game object.
+
+    Returns a dict with these optional integer keys (0-100):
+      spread_home_pct   — % of spread tickets on home team
+      spread_away_pct   — % of spread tickets on away team
+      money_home_pct    — % of spread money on home team
+      money_away_pct    — % of spread money on away team
+      ml_home_pct       — % of ML tickets on home team
+      ml_away_pct       — % of ML tickets on away team
+      over_pct          — % of total tickets on Over
+      under_pct         — % of total tickets on Under
+    """
+    result: Dict[str, Optional[int]] = {}
+    if not an_game:
+        return result
+
+    teams = an_game.get("teams") or []
+    home_t = next((t for t in teams if t.get("is_home") or t.get("homeAway") == "home"), None)
+    away_t = next((t for t in teams if not (t.get("is_home") or t.get("homeAway") == "home")), None)
+
+    def _pct(obj: Optional[Dict], *keys: str) -> Optional[int]:
+        if not obj:
+            return None
+        for k in keys:
+            v = obj.get(k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    result["spread_home_pct"] = _pct(home_t, "spread_tickets", "spread_pct", "tickets_pct")
+    result["spread_away_pct"] = _pct(away_t, "spread_tickets", "spread_pct", "tickets_pct")
+    result["money_home_pct"]  = _pct(home_t, "spread_money", "money_pct")
+    result["money_away_pct"]  = _pct(away_t, "spread_money", "money_pct")
+    result["ml_home_pct"]     = _pct(home_t, "ml_tickets", "ml_pct")
+    result["ml_away_pct"]     = _pct(away_t, "ml_tickets", "ml_pct")
+    result["over_pct"]        = _pct(an_game, "over_tickets", "over_pct")
+    result["under_pct"]       = _pct(an_game, "under_tickets", "under_pct")
+    return result
+
+
+def rlm_signal(
+    pick_text: str,
+    home_team: str,
+    away_team: str,
+    bet_pcts: Dict[str, Optional[int]],
+) -> Optional[str]:
+    """Detect Reverse Line Movement (RLM): the line moved AGAINST the public.
+
+    RLM means sharp (professional) money is on the side the public is fading.
+    It's one of the strongest indicators that smart money disagrees with the crowd.
+
+    Returns a descriptive string if RLM is detected, else None.
+    """
+    if not bet_pcts:
+        return None
+
+    clean = pick_text.replace("[MULTI-SIGNAL] ", "")
+    is_total = clean.startswith("FOLLOW: Over") or clean.startswith("FOLLOW: Under")
+
+    if is_total:
+        over_pct = bet_pcts.get("over_pct")
+        under_pct = bet_pcts.get("under_pct")
+        if over_pct is None and under_pct is None:
+            return None
+        if clean.startswith("FOLLOW: Over") and over_pct is not None and over_pct < 45:
+            return (
+                f"📡 RLM: Only {over_pct}% of public bets on Over — "
+                f"line still moved Up. Sharp money may be on Over despite public fading it."
+            )
+        if clean.startswith("FOLLOW: Under") and under_pct is not None and under_pct < 45:
+            return (
+                f"📡 RLM: Only {under_pct}% of public bets on Under — "
+                f"line still moved Down. Sharp money may be on Under despite public fading it."
+            )
+        return None
+
+    followed = _pick_team(clean, home_team, away_team)
+    if followed is None:
+        return None
+
+    is_home = followed == home_team
+    spread_pct = bet_pcts.get("spread_home_pct" if is_home else "spread_away_pct")
+    money_pct  = bet_pcts.get("money_home_pct" if is_home else "money_away_pct")
+
+    if spread_pct is None:
+        return None
+
+    if spread_pct < 40:
+        money_note = f", {money_pct}% of money" if money_pct is not None else ""
+        return (
+            f"📡 RLM: Only {spread_pct}% of public bets on {followed}{money_note} — "
+            f"but the line still moved their way. Classic sharp-money signal."
+        )
+    if spread_pct > 60:
+        money_note = f", {money_pct}% of money" if money_pct is not None else ""
+        return (
+            f"⚠️ Public side: {spread_pct}% of bets on {followed}{money_note}. "
+            f"Line moved with the public — less convincing as a sharp signal."
+        )
+    return None
+
+
+def fetch_dk_odds(league: str) -> List[Dict]:
+    """Try to fetch current DraftKings odds via their public API (no auth).
+
+    DraftKings does not officially expose a public API, but they have
+    several endpoints that work without authentication. Returns empty list
+    if the API is unavailable or the response format is unexpected.
+    """
+    league_id = DK_LEAGUE_IDS.get(league)
+    if not league_id:
+        return []
+
+    # Try DraftKings' known public sportsbook API endpoints
+    urls = [
+        f"https://sportsbook.draftkings.com/api/odds/v1/leagues/{league_id}/categories/743/subcategories/5517",
+        f"https://api.draftkings.com/lineups/v1/tiers/offering/sports/{league_id}/draftgroups?format=json",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=8)
+            if resp.ok:
+                data = resp.json()
+                events = (
+                    data.get("eventGroups")
+                    or data.get("events")
+                    or data.get("offers")
+                    or []
+                )
+                if isinstance(events, list) and events:
+                    return events
+        except Exception:
+            continue
+    return []
+
+
+def match_dk_game(
+    home_team: str, away_team: str, dk_events: List[Dict]
+) -> Optional[Dict]:
+    """Try to match an ESPN game to a DraftKings event by team name."""
+    home_norm = _normalize_team(home_team)
+    away_norm = _normalize_team(away_team)
+    for ev in dk_events:
+        name = _normalize_team(ev.get("name") or ev.get("eventName") or "")
+        if (home_norm in name or any(w in name for w in home_norm.split())) and \
+           (away_norm in name or any(w in name for w in away_norm.split())):
+            return ev
+    return None
+
+
+# ─── Core signal detection ─────────────────────────────────────────────────
+
 def collect_market_moves(
     league: str,
     line: Dict,
@@ -144,20 +401,17 @@ def collect_market_moves(
     total_threshold: float,
     moneyline_threshold: float,
 ) -> List[Tuple[str, float]]:
-    """Return list of (pick_text, confidence_score) tuples sorted by confidence desc.
+    """Return list of (pick_text, signal_score) tuples sorted by score desc.
 
-    Confidence score components (all additive, capped at 1.0):
+    Signal score components (additive, capped at 1.0):
       - Base:              normalized move magnitude (2× threshold → 1.0 base).
       - Convergence bonus (+0.25): spread and ML both moved toward the same team.
-      - Vig confirmation  (+0.15): juice tightened on the steamed side, confirming
-                                   sharp-money pressure rather than a stale adjust.
-      - Key number bonus  (+0.20): spread move crossed a key landing number for the
-                                   sport (e.g., 3 or 7 in NFL/NCAAF).
-      - Multi-signal bonus(+0.20): spread AND ML both independently crossed their
-                                   own thresholds pointing to the same team — the
-                                   single strongest convergence signal.
-      - Conflict penalty  (-0.20): spread and ML moved in opposite directions —
-                                   reduces confidence when signals disagree.
+      - Vig confirmation  (+0.15): juice tightened on the steamed side.
+      - Key number bonus  (+0.20): spread move crossed a key landing number.
+      - Multi-signal bonus(+0.20): spread AND ML both independently triggered.
+      - Conflict penalty  (-0.20): spread and ML moved in opposite directions.
+
+    Note: scores describe signal strength, not win probability.
     """
     picks: List[Tuple[str, float]] = []
 
@@ -174,10 +428,10 @@ def collect_market_moves(
         return picks
     odds = odds_list[0]
 
-    # ── Moneyline: compute delta first so spread section can use it for convergence.
+    # ── Moneyline ────────────────────────────────────────────────────────────
     moneyline = odds.get("moneyline")
     home_ml_delta: Optional[float] = None
-    ml_home_triggered = False  # True when ML independently crosses its threshold
+    ml_home_triggered = False
     ml_away_triggered = False
     if moneyline:
         home_ml_open = american_to_prob(moneyline.get("home", {}).get("open", {}).get("odds"))
@@ -189,7 +443,7 @@ def collect_market_moves(
             ml_home_triggered = home_ml_delta >= moneyline_threshold
             ml_away_triggered = home_ml_delta <= -moneyline_threshold
 
-    # ── Spreads (follow the move; price-only for NHL/MLB run/puck lines) ────────
+    # ── Spreads ──────────────────────────────────────────────────────────────
     spread = odds.get("pointSpread")
     if spread:
         home_open = parse_point(spread.get("home", {}).get("open", {}).get("line"))
@@ -201,13 +455,11 @@ def collect_market_moves(
         away_open_price = american_to_prob(spread.get("away", {}).get("open", {}).get("odds"))
         away_cur_price = american_to_prob(spread.get("away", {}).get("close", {}).get("odds"))
         if None not in (home_open, home_cur, away_open, away_cur):
-            # NHL/MLB: spreads rarely move off ±1.5; use price shift primarily.
             if league in {"NHL", "MLB"} and abs(home_open) == 1.5 and abs(home_cur) == 1.5:
                 if home_open_price is not None and home_cur_price is not None:
                     price_delta = home_cur_price - home_open_price
                     if abs(price_delta) >= moneyline_threshold:
                         base = _score(price_delta, moneyline_threshold)
-                        # Convergence: ML moved the same direction as the price shift.
                         converge = (
                             home_ml_delta is not None
                             and (
@@ -215,7 +467,6 @@ def collect_market_moves(
                                 or (price_delta < 0 and home_ml_delta < 0)
                             )
                         )
-                        # Conflict: ML moved opposite to price shift.
                         conflict = (
                             home_ml_delta is not None
                             and (
@@ -238,20 +489,14 @@ def collect_market_moves(
                                 f"FOLLOW: {away_team} {away_cur:+} — price firmed by {-price_delta*100:+.1f}pp at same line",
                                 score,
                             ))
-                # skip point-based logic for puck/run lines
             else:
                 delta_line = home_cur - home_open
-
-                # FIX: When the spread crosses zero (team flips from favourite to
-                # underdog or vice versa), abs(cur) - abs(open) collapses to ~0
-                # even though the actual move is large. Use raw delta_line in that
-                # case so the full magnitude is captured.
                 sign_flipped = (home_open != 0 and home_cur != 0
                                 and (home_open < 0) != (home_cur < 0))
                 if sign_flipped:
                     delta = abs(delta_line)
                 else:
-                    delta = abs(home_cur) - abs(home_open)  # magnitude toward/away from 0
+                    delta = abs(home_cur) - abs(home_open)
 
                 price_delta: Optional[float] = None
                 if home_open_price is not None and home_cur_price is not None:
@@ -260,25 +505,14 @@ def collect_market_moves(
                 if away_open_price is not None and away_cur_price is not None:
                     away_price_delta = away_cur_price - away_open_price
 
-                # Determine direction of the spread move.
-                # delta < 0  →  home absolute value shrank (home less favored, away steamed) → follow home
-                # delta > 0  →  home absolute value grew  (home more favored, home steamed) → follow away
-                # (sign_flipped overrides with the raw delta_line sign)
                 effective_delta = delta_line if sign_flipped else (abs(home_cur) - abs(home_open))
 
                 if effective_delta <= -spread_threshold:
-                    # Away was steamed → home is now undervalued → FOLLOW Home.
                     base = _score(effective_delta, spread_threshold)
-                    # Convergence: ML also moved toward home (home gaining probability).
                     converge = home_ml_delta is not None and home_ml_delta > 0
-                    # Vig confirmation: AWAY juice tightened (away became more expensive),
-                    # confirming it was away-side demand that drove the line move.
                     vig_confirm = away_price_delta is not None and away_price_delta > 0
-                    # Key number bonus: spread move crossed a key landing number.
                     key_num = _crosses_key_number(home_open, home_cur, league)
-                    # Multi-signal: ML also independently crossed its threshold toward home.
                     multi = ml_home_triggered
-                    # Conflict: ML moved opposite (toward away) despite spread saying follow home.
                     conflict = home_ml_delta is not None and home_ml_delta < -moneyline_threshold
                     score = max(
                         min(
@@ -297,12 +531,8 @@ def collect_market_moves(
                         score,
                     ))
                 elif effective_delta >= spread_threshold:
-                    # Home was steamed → away (dog) is now undervalued → FOLLOW Away.
                     base = _score(effective_delta, spread_threshold)
-                    # Convergence: ML also moved toward away (home losing probability).
                     converge = home_ml_delta is not None and home_ml_delta < 0
-                    # Vig confirmation: HOME juice tightened (home became more expensive),
-                    # confirming home-side demand drove the line move.
                     vig_confirm = price_delta is not None and price_delta > 0
                     key_num = _crosses_key_number(home_open, home_cur, league)
                     multi = ml_away_triggered
@@ -328,7 +558,6 @@ def collect_market_moves(
                     and abs(price_delta) >= moneyline_threshold
                     and home_cur == home_open
                 ):
-                    # Line didn't move but juice shifted — price-only steam signal.
                     base = _score(price_delta, moneyline_threshold)
                     converge = (
                         home_ml_delta is not None
@@ -360,12 +589,11 @@ def collect_market_moves(
                             score,
                         ))
 
-    # ── Totals (follow-the-move) ─────────────────────────────────────────────
+    # ── Totals ───────────────────────────────────────────────────────────────
     total = odds.get("total")
     if total:
         open_point = parse_point(total.get("over", {}).get("open", {}).get("line"))
         cur_point = parse_point(total.get("over", {}).get("close", {}).get("line"))
-        # Track juice direction for vig confirmation.
         over_open_price = american_to_prob(total.get("over", {}).get("open", {}).get("odds"))
         over_cur_price = american_to_prob(total.get("over", {}).get("close", {}).get("odds"))
         under_open_price = american_to_prob(total.get("under", {}).get("open", {}).get("odds"))
@@ -374,7 +602,6 @@ def collect_market_moves(
             delta = cur_point - open_point
             if delta >= total_threshold:
                 base = _score(delta, total_threshold)
-                # Vig confirmation: Over vig also tightened (over_cur_price rose).
                 vig_confirm = (
                     over_open_price is not None
                     and over_cur_price is not None
@@ -387,7 +614,6 @@ def collect_market_moves(
                 ))
             elif delta <= -total_threshold:
                 base = _score(delta, total_threshold)
-                # Vig confirmation: Under vig also tightened (under_cur_price rose).
                 vig_confirm = (
                     under_open_price is not None
                     and under_cur_price is not None
@@ -399,7 +625,7 @@ def collect_market_moves(
                     score,
                 ))
 
-    # ── Moneylines (follow-the-move) ─────────────────────────────────────────
+    # ── Moneylines ───────────────────────────────────────────────────────────
     if moneyline and home_ml_delta is not None:
         if home_ml_delta >= moneyline_threshold:
             swing = home_ml_delta * 100
@@ -418,10 +644,11 @@ def collect_market_moves(
                 score,
             ))
 
-    # Sort descending by confidence so callers always see the best picks first.
     picks.sort(key=lambda t: t[1], reverse=True)
     return picks
 
+
+# ─── Injury helpers ───────────────────────────────────────────────────────────
 
 def fetch_injuries(league: str) -> Dict[str, List[Dict[str, str]]]:
     urls = {
@@ -484,7 +711,6 @@ def fetch_game_injuries(league: str, game_id: str) -> Dict[str, List[Dict[str, s
         cols = [str(c).lower() for c in df.columns]
         if not any("inj" in c for c in cols):
             continue
-        # Expect columns like ['Player', 'Pos', 'Status', 'Injury']
         for _, row in df.iterrows():
             player = str(row.get(df.columns[0], "")).strip()
             status = str(row.get("Status", row.get(df.columns[2], ""))).strip()
@@ -499,28 +725,15 @@ def fetch_game_injuries(league: str, game_id: str) -> Dict[str, List[Dict[str, s
     return result
 
 
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Market movement scanner from ESPN odds page (open vs current)."
     )
-    parser.add_argument(
-        "--spread-threshold",
-        type=float,
-        default=None,
-        help="Min spread move (points) to flag a side. Default uses sport-specific thresholds.",
-    )
-    parser.add_argument(
-        "--total-threshold",
-        type=float,
-        default=None,
-        help="Min total move (points) to flag a side. Default uses sport-specific thresholds.",
-    )
-    parser.add_argument(
-        "--moneyline-threshold",
-        type=float,
-        default=None,
-        help="Min implied probability change to flag a side (e.g., 0.05 = 5pp). Default uses sport-specific thresholds.",
-    )
+    parser.add_argument("--spread-threshold", type=float, default=None)
+    parser.add_argument("--total-threshold", type=float, default=None)
+    parser.add_argument("--moneyline-threshold", type=float, default=None)
     return parser.parse_args()
 
 
@@ -574,7 +787,6 @@ def main() -> None:
             away_team = away.get("team", {}).get("displayName", "Away")
             start = iso_to_local_text(line.get("date", ""))
             print(f"- {away_team} @ {home_team} — {start}")
-            # Injury snippets (top 3 per team)
             league_inj = injuries_by_league.get(league, {})
             game_inj = fetch_game_injuries(league, line.get("id", ""))
             home_inj = game_inj.get(_normalize_team(home_team), []) or league_inj.get(
@@ -600,7 +812,7 @@ def main() -> None:
                 print(f"    Injuries: {' | '.join(parts)}")
             for pick_text, score in picks:
                 label = confidence_label(score)
-                print(f"    • [{label} {score*100:.0f}%] {pick_text}")
+                print(f"    • [{label}] Signal: {score*100:.0f}% — {pick_text}")
 
 
 if __name__ == "__main__":
