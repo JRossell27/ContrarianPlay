@@ -10,6 +10,7 @@ from contrarian import (
     iso_to_local_text,
     iter_events,
     _normalize_team,
+    _pick_team,
 )
 
 import pandas as pd
@@ -66,6 +67,70 @@ def _render_pick(pick_text: str, score: float) -> None:
         )
     else:
         st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {display_text}")
+
+
+def _significant_injuries(inj_list: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Return players with OUT or DOUBTFUL status — these are the critical ones."""
+    return [r for r in inj_list if any(
+        kw in r.get("status", "").upper() for kw in ("OUT", "DOUBT")
+    )]
+
+
+def _injury_caution(
+    pick_text: str,
+    home_team: str,
+    away_team: str,
+    home_inj: List[Dict[str, str]],
+    away_inj: List[Dict[str, str]],
+) -> Optional[str]:
+    """Return a caution string if injuries may explain the line move, else None.
+
+    Core contrarian rule: a line move caused by an injury is NOT a sharp-money
+    signal — it's a books adjustment for a known news item. If the opposing team
+    (the one the line moved against) has OUT/DOUBTFUL players, flag it.
+    """
+    clean = pick_text.replace("[MULTI-SIGNAL] ", "")
+
+    # Totals: either team's injury can drive the total up or down.
+    if clean.startswith("FOLLOW: Over") or clean.startswith("FOLLOW: Under"):
+        parts = []
+        for team, inj in ((away_team, away_inj), (home_team, home_inj)):
+            sig = _significant_injuries(inj)
+            if sig:
+                names = ", ".join(r["player"] for r in sig[:2])
+                parts.append(f"{team}: {names}")
+        if parts:
+            return (
+                "⚠️ Injury flag — key players OUT/DOUBTFUL: "
+                + " | ".join(parts)
+                + ". Verify the total move isn't injury-driven before playing."
+            )
+        return None
+
+    # Spread / ML: the opposing team is the one the line moved against.
+    followed = _pick_team(clean, home_team, away_team)
+    if followed is None:
+        return None
+    opposing_team = away_team if followed == home_team else home_team
+    opposing_inj = away_inj if followed == home_team else home_inj
+    sig = _significant_injuries(opposing_inj)
+    if sig:
+        names = ", ".join(r["player"] for r in sig[:2])
+        extra = f" +{len(sig) - 2} more" if len(sig) > 2 else ""
+        return (
+            f"⚠️ Injury flag — {opposing_team} has {names}{extra} OUT/DOUBTFUL. "
+            f"Line move may be injury-driven, not sharp money — verify before playing."
+        )
+    return None
+
+
+def _render_inj_row(team: str, inj_list: List[Dict[str, str]]) -> str:
+    """Format a team's injury row: OUT/DOUBTFUL first (🔴), then QUESTIONABLE (🟡)."""
+    sig = _significant_injuries(inj_list)
+    quest = [r for r in inj_list if "QUEST" in r.get("status", "").upper()]
+    parts = [f"🔴 {r['player']} ({r['status']})" for r in sig]
+    parts += [f"🟡 {r['player']} (Q)" for r in quest[:3]]
+    return f"{team}: " + " · ".join(parts) if parts else ""
 
 
 @st.cache_data(ttl=300)
@@ -219,25 +284,19 @@ if fetch:
                 link = game_url(league, line.get("id", ""))
                 if link:
                     st.caption(f"[ESPN game page]({link})")
-                # Injury snippets
-                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
-                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
-                if home_inj or away_inj:
-                    txt = []
-                    if away_inj:
-                        txt.append(
-                            f"{away_team} injuries: "
-                            + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
-                        )
-                    if home_inj:
-                        txt.append(
-                            f"{home_team} injuries: "
-                            + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
-                        )
-                    st.caption(" | ".join(txt))
-                # picks are sorted by score descending; display with confidence icon.
+                # Injury display: OUT/DOUBTFUL (🔴) first, then QUESTIONABLE (🟡)
+                home_inj = league_inj.get(_normalize_team(home_team), [])
+                away_inj = league_inj.get(_normalize_team(away_team), [])
+                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [r for r in inj_rows if r]
+                if inj_rows:
+                    st.caption(" | ".join(inj_rows))
+                # Picks with per-pick injury caution
                 for pick_text, score in picks:
                     _render_pick(pick_text, score)
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    if caution:
+                        st.caption(caution)
                 st.divider()
 
 if fetch and state:
@@ -300,23 +359,17 @@ if fetch and state:
                 away_team = away.get("team", {}).get("displayName", "Away")
                 start = iso_to_local_text(line.get("date", ""))
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
-                home_inj = league_inj.get(_normalize_team(home_team), [])[:3]
-                away_inj = league_inj.get(_normalize_team(away_team), [])[:3]
-                if home_inj or away_inj:
-                    txt = []
-                    if away_inj:
-                        txt.append(
-                            f"{away_team} injuries: "
-                            + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
-                        )
-                    if home_inj:
-                        txt.append(
-                            f"{home_team} injuries: "
-                            + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
-                        )
-                    st.caption(" | ".join(txt))
+                home_inj = league_inj.get(_normalize_team(home_team), [])
+                away_inj = league_inj.get(_normalize_team(away_team), [])
+                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [r for r in inj_rows if r]
+                if inj_rows:
+                    st.caption(" | ".join(inj_rows))
                 for pick_text, score in picks:
                     _render_pick(pick_text, score)
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    if caution:
+                        st.caption(caution)
                 st.divider()
 else:
     st.info('Set your thresholds and click "Find contrarian plays".')
@@ -419,20 +472,18 @@ if st.button("Find totals with context"):
                 if stat_line:
                     st.caption(" • ".join(stat_line))
 
-                # Injuries snippet (league-level only)
-                home_inj = injuries.get(_normalize_team(home_team), [])[:3]
-                away_inj = injuries.get(_normalize_team(away_team), [])[:3]
-                if home_inj or away_inj:
-                    txt = []
-                    if home_inj:
-                        txt.append(
-                            f"{home_team} injuries: " + "; ".join(f"{r['player']} ({r['status']})" for r in home_inj)
-                        )
-                    if away_inj:
-                        txt.append(
-                            f"{away_team} injuries: " + "; ".join(f"{r['player']} ({r['status']})" for r in away_inj)
-                        )
-                    st.caption(" | ".join(txt))
+                # Injuries with caution
+                home_inj = injuries.get(_normalize_team(home_team), [])
+                away_inj = injuries.get(_normalize_team(away_team), [])
+                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [r for r in inj_rows if r]
+                if inj_rows:
+                    st.caption(" | ".join(inj_rows))
+                for pick_text, _ in picks:
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    if caution:
+                        st.caption(caution)
+                        break  # one caution per game is enough for totals
 
                 # Simple recommendation tag based on highest-confidence pick.
                 best_pick_text = picks[0][0]  # already sorted by score desc
