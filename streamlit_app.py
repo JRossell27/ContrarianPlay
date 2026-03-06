@@ -34,10 +34,12 @@ with st.expander("How to read the signals (quick rules)"):
 - ⚠️ Contrarian requires no obvious news: if injury/goalie/pitcher explains the move, pass.
 - ⚠️ Freezes/reversals matter: popular side not moving or a snap-back late can flip the lean.
 - ❌ If you can't explain the bet in one sentence ("Line moved ___ with no news, book protecting ___"), pass.
-- 🔒 **LOCK (≥75%)** — spread + ML convergence or large magnitude move (highest confidence).
+- 🔒🔒 **MULTI-SIGNAL LOCK** — spread AND moneyline both independently crossed their thresholds pointing to the same team. Highest confidence tier.
+- 🔒 **LOCK (≥75%)** — large magnitude move, convergence bonus, vig confirmation, and/or key-number crossing. Very high confidence.
 - ⚡ **STRONG (50–74%)** — meaningful move with partial confirmation.
 - ✅ **LEAN (25–49%)** — threshold met but single signal only.
 - 👁 **WATCH (<25%)** — borderline; treat as informational only.
+- Score is *reduced* when spread and ML move in opposite directions (conflict penalty).
         """
     )
 
@@ -50,6 +52,20 @@ def _pick_icon(score: float) -> str:
     if score >= 0.25:
         return "✅"
     return "👁"
+
+
+def _render_pick(pick_text: str, score: float) -> None:
+    """Render a single pick line with appropriate icon, label, and highlight."""
+    icon = _pick_icon(score)
+    label = confidence_label(score)
+    is_multi = pick_text.startswith("[MULTI-SIGNAL]")
+    display_text = pick_text.replace("[MULTI-SIGNAL] ", "")
+    if is_multi:
+        st.markdown(
+            f"- 🔒🔒 **[MULTI-SIGNAL LOCK {score*100:.0f}%]** {display_text}"
+        )
+    else:
+        st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {display_text}")
 
 
 @st.cache_data(ttl=300)
@@ -221,9 +237,7 @@ if fetch:
                     st.caption(" | ".join(txt))
                 # picks are sorted by score descending; display with confidence icon.
                 for pick_text, score in picks:
-                    icon = _pick_icon(score)
-                    label = confidence_label(score)
-                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
+                    _render_pick(pick_text, score)
                 st.divider()
 
 if fetch and state:
@@ -302,9 +316,7 @@ if fetch and state:
                         )
                     st.caption(" | ".join(txt))
                 for pick_text, score in picks:
-                    icon = _pick_icon(score)
-                    label = confidence_label(score)
-                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
+                    _render_pick(pick_text, score)
                 st.divider()
 else:
     st.info("Set your thresholds and click "Find contrarian plays".")
@@ -390,9 +402,7 @@ if st.button("Find totals with context"):
 
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
                 for pick_text, score in picks:
-                    icon = _pick_icon(score)
-                    label = confidence_label(score)
-                    st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {pick_text}")
+                    _render_pick(pick_text, score)
 
                 # Attach quick stats
                 home_stats = stats.get(_normalize_team(home_team), {})
