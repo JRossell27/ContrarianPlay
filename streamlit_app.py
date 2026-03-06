@@ -69,6 +69,58 @@ def _render_pick(pick_text: str, score: float) -> None:
         st.markdown(f"- {icon} **[{label} {score*100:.0f}%]** {display_text}")
 
 
+# Impact tier per position per sport (1=critical, 2=high, 3=medium, 4=low).
+# Tier 1: a single player missing moves the line by itself (QB, NHL goalie, MLB starter).
+# Tier 2: key starters whose absence hurts significantly.
+# Tier 3: rotation / depth players.
+# Tier 4: specialists / relief — minimal line impact.
+_POS_TIERS: Dict[str, Dict[str, int]] = {
+    "NFL": {
+        "QB": 1,
+        "RB": 2, "WR": 2, "TE": 2, "OT": 2, "OG": 2, "G": 2, "OL": 2,
+        "CB": 3, "S": 3, "LB": 3, "DE": 3, "DT": 3, "DB": 3, "DL": 3, "NT": 3,
+        "K": 4, "P": 4, "LS": 4,
+    },
+    "NCAAF": {
+        "QB": 1,
+        "RB": 2, "WR": 2, "TE": 2, "OT": 2, "OG": 2, "G": 2, "OL": 2,
+        "CB": 3, "S": 3, "LB": 3, "DE": 3, "DT": 3, "DB": 3,
+        "K": 4, "P": 4,
+    },
+    "NBA": {
+        # All five positions matter equally; stars are identified by usage, not pos.
+        # Position tier 2 for all — star detection relies on ESPN listing order.
+        "PG": 2, "SG": 2, "SF": 2, "PF": 2, "C": 2,
+        "G": 2, "F": 2, "G-F": 2, "F-G": 2, "F-C": 2, "C-F": 2,
+    },
+    "NCAAM": {
+        "PG": 2, "SG": 2, "SF": 2, "PF": 2, "C": 2,
+        "G": 2, "F": 2,
+    },
+    "NHL": {
+        "G": 1,                          # Goalie = game-changer
+        "C": 2, "LW": 2, "RW": 2, "W": 2, "F": 2,
+        "D": 3, "LD": 3, "RD": 3,
+    },
+    "MLB": {
+        "SP": 1,                         # Starting pitcher on their day = critical
+        "C": 2, "3B": 2, "SS": 2, "CF": 2,
+        "1B": 3, "2B": 3, "LF": 3, "RF": 3, "OF": 3, "DH": 3,
+        "RP": 4, "CL": 4, "MR": 4,
+    },
+}
+
+_POS_LABELS: Dict[str, str] = {
+    # Human-readable overrides for the most impactful positions.
+    "QB": "QB", "G": "Goalie", "SP": "SP",
+}
+
+
+def _pos_tier(pos: str, league: str) -> int:
+    """Return impact tier (1=critical … 4=low). Defaults to 3 (medium)."""
+    return _POS_TIERS.get(league, {}).get(pos.upper().strip(), 3)
+
+
 def _significant_injuries(inj_list: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Return players with OUT or DOUBTFUL status — these are the critical ones."""
     return [r for r in inj_list if any(
@@ -82,26 +134,37 @@ def _injury_caution(
     away_team: str,
     home_inj: List[Dict[str, str]],
     away_inj: List[Dict[str, str]],
+    league: str = "",
 ) -> Optional[str]:
     """Return a caution string if injuries may explain the line move, else None.
 
     Core contrarian rule: a line move caused by an injury is NOT a sharp-money
     signal — it's a books adjustment for a known news item. If the opposing team
     (the one the line moved against) has OUT/DOUBTFUL players, flag it.
+    Escalates to 🚨 when a Tier-1 position (QB, goalie, starting pitcher) is out.
     """
     clean = pick_text.replace("[MULTI-SIGNAL] ", "")
 
     # Totals: either team's injury can drive the total up or down.
     if clean.startswith("FOLLOW: Over") or clean.startswith("FOLLOW: Under"):
         parts = []
+        has_star = False
         for team, inj in ((away_team, away_inj), (home_team, home_inj)):
             sig = _significant_injuries(inj)
-            if sig:
-                names = ", ".join(r["player"] for r in sig[:2])
-                parts.append(f"{team}: {names}")
+            if not sig:
+                continue
+            sig.sort(key=lambda r: _pos_tier(r.get("pos", ""), league))
+            if any(_pos_tier(r.get("pos", ""), league) == 1 for r in sig):
+                has_star = True
+            names = ", ".join(
+                f"{r['player']} ({r.get('pos', '')})" if r.get("pos") else r["player"]
+                for r in sig[:2]
+            )
+            parts.append(f"{team}: {names}")
         if parts:
+            prefix = "🚨 STAR PLAYER injury flag" if has_star else "⚠️ Injury flag"
             return (
-                "⚠️ Injury flag — key players OUT/DOUBTFUL: "
+                f"{prefix} — key players OUT/DOUBTFUL: "
                 + " | ".join(parts)
                 + ". Verify the total move isn't injury-driven before playing."
             )
@@ -115,21 +178,46 @@ def _injury_caution(
     opposing_inj = away_inj if followed == home_team else home_inj
     sig = _significant_injuries(opposing_inj)
     if sig:
-        names = ", ".join(r["player"] for r in sig[:2])
+        sig.sort(key=lambda r: _pos_tier(r.get("pos", ""), league))
+        has_star = any(_pos_tier(r.get("pos", ""), league) == 1 for r in sig)
+        names = ", ".join(
+            f"{r['player']} ({r.get('pos', '')})" if r.get("pos") else r["player"]
+            for r in sig[:2]
+        )
         extra = f" +{len(sig) - 2} more" if len(sig) > 2 else ""
+        prefix = "🚨 STAR PLAYER injury flag" if has_star else "⚠️ Injury flag"
         return (
-            f"⚠️ Injury flag — {opposing_team} has {names}{extra} OUT/DOUBTFUL. "
+            f"{prefix} — {opposing_team} has {names}{extra} OUT/DOUBTFUL. "
             f"Line move may be injury-driven, not sharp money — verify before playing."
         )
     return None
 
 
-def _render_inj_row(team: str, inj_list: List[Dict[str, str]]) -> str:
-    """Format a team's injury row: OUT/DOUBTFUL first (🔴), then QUESTIONABLE (🟡)."""
+def _render_inj_row(team: str, inj_list: List[Dict[str, str]], league: str = "") -> str:
+    """Format a team's injury row sorted by position impact tier.
+
+    ⭐🔴 = critical position OUT/DOUBTFUL (QB, NHL goalie, MLB SP)
+    🔴   = key position OUT/DOUBTFUL
+    🟡   = QUESTIONABLE (top 3 only)
+    """
     sig = _significant_injuries(inj_list)
     quest = [r for r in inj_list if "QUEST" in r.get("status", "").upper()]
-    parts = [f"🔴 {r['player']} ({r['status']})" for r in sig]
-    parts += [f"🟡 {r['player']} (Q)" for r in quest[:3]]
+
+    sig.sort(key=lambda r: _pos_tier(r.get("pos", ""), league))
+    quest.sort(key=lambda r: _pos_tier(r.get("pos", ""), league))
+
+    parts = []
+    for r in sig:
+        tier = _pos_tier(r.get("pos", ""), league)
+        star = "⭐" if tier == 1 else ""
+        pos_tag = f" {r['pos']}" if r.get("pos") else ""
+        parts.append(f"{star}🔴 {r['player']}{pos_tag} ({r['status']})")
+    for r in quest[:3]:
+        tier = _pos_tier(r.get("pos", ""), league)
+        star = "⭐" if tier == 1 else ""
+        pos_tag = f" {r['pos']}" if r.get("pos") else ""
+        parts.append(f"{star}🟡 {r['player']}{pos_tag} (Q)")
+
     return f"{team}: " + " · ".join(parts) if parts else ""
 
 
@@ -287,14 +375,14 @@ if fetch:
                 # Injury display: OUT/DOUBTFUL (🔴) first, then QUESTIONABLE (🟡)
                 home_inj = league_inj.get(_normalize_team(home_team), [])
                 away_inj = league_inj.get(_normalize_team(away_team), [])
-                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [_render_inj_row(t, inj, league) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
                 inj_rows = [r for r in inj_rows if r]
                 if inj_rows:
                     st.caption(" | ".join(inj_rows))
                 # Picks with per-pick injury caution
                 for pick_text, score in picks:
                     _render_pick(pick_text, score)
-                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj, league)
                     if caution:
                         st.caption(caution)
                 st.divider()
@@ -361,13 +449,13 @@ if fetch and state:
                 st.markdown(f"**{away_team} @ {home_team}** — {start}")
                 home_inj = league_inj.get(_normalize_team(home_team), [])
                 away_inj = league_inj.get(_normalize_team(away_team), [])
-                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [_render_inj_row(t, inj, league) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
                 inj_rows = [r for r in inj_rows if r]
                 if inj_rows:
                     st.caption(" | ".join(inj_rows))
                 for pick_text, score in picks:
                     _render_pick(pick_text, score)
-                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj, league)
                     if caution:
                         st.caption(caution)
                 st.divider()
@@ -475,12 +563,12 @@ if st.button("Find totals with context"):
                 # Injuries with caution
                 home_inj = injuries.get(_normalize_team(home_team), [])
                 away_inj = injuries.get(_normalize_team(away_team), [])
-                inj_rows = [_render_inj_row(t, inj) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
+                inj_rows = [_render_inj_row(t, inj, league) for t, inj in ((away_team, away_inj), (home_team, home_inj))]
                 inj_rows = [r for r in inj_rows if r]
                 if inj_rows:
                     st.caption(" | ".join(inj_rows))
                 for pick_text, _ in picks:
-                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj)
+                    caution = _injury_caution(pick_text, home_team, away_team, home_inj, away_inj, league)
                     if caution:
                         st.caption(caution)
                         break  # one caution per game is enough for totals
